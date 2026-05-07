@@ -9,26 +9,6 @@
 import { z } from 'zod';
 
 /**
- * Database connection settings
- */
-export interface DatabaseConfig {
-  host: string;
-  port: number;
-  name: string;
-  user: string;
-  password: string;
-}
-
-/**
- * Geolocation settings
- */
-export interface GeolocationConfig {
-  service: string;
-  override?: string;
-  fallbackTimezone: string;
-}
-
-/**
  * Top-level CCP configuration
  */
 export interface CcpConfig {
@@ -37,11 +17,31 @@ export interface CcpConfig {
 }
 
 /**
+ * Database connection settings
+ */
+export interface DatabaseConfig {
+  host: string;
+  name: string;
+  password: string;
+  port: number;
+  user: string;
+}
+
+/**
+ * Geolocation settings
+ */
+export interface GeolocationConfig {
+  fallbackTimezone: string;
+  override?: string;
+  service: string;
+}
+
+/**
  * CCP Configuration Parser and Validator
  *
  * Loads configuration from a JSON file path resolved in this order:
  *   1. `CCP_CONFIG_PATH` env var
- *   2. `~/.config/ccp/config.json`
+ *   2. `~/.claude/ccp/config.json`
  *   3. Bundled defaults (if no file exists)
  *
  * Validates with Zod schema; throws on invalid configuration.
@@ -73,7 +73,7 @@ export class Config {
   /**
    * Creates a new Config instance with validated settings
    *
-   * Private — use `Config.load()` to construct.
+   * Private, use `Config.validate(raw)` to construct.
    *
    * @private
    * @param {CcpConfig} settings - Pre-validated configuration

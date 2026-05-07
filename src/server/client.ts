@@ -6,90 +6,105 @@
  * @license BSD-3-Clause
  */
 
-import { readdirSync, readFileSync, statSync, existsSync } from 'fs';
-import { dirname, join, sep } from 'path';
-import { fileURLToPath } from 'url';
+import { existsSync, readdirSync, readFileSync, statSync } from 'fs';
 import { homedir } from 'os';
+import { dirname, join, sep } from 'path';
 import postgres from 'postgres';
+import { fileURLToPath } from 'url';
 import { Config } from './config.js';
-
-/**
- * Migration record returned by the update tool
- */
-export interface MigrationRecord {
-  version: number;
-  name: string;
-}
-
-/**
- * Update tool result
- */
-export interface UpdateResult {
-  applied: MigrationRecord[];
-  currentVersion: number;
-  latestVersion: number;
-}
 
 /**
  * Bundled migration file discovered at runtime
  */
 interface BundledMigration {
-  version: number;
   name: string;
   path: string;
-}
-
-/**
- * Profile node in an inheritance chain with its observations
- */
-export interface ProfileNode {
-  name: string;
-  description: string | null;
-  inheritance: string[];
-  depth: number;
-  observations: Record<string, string[]>;
+  version: number;
 }
 
 /**
  * Cycle row with its behavioral indicators
  */
 export interface CycleNode {
+  indicators: string[];
+  label: string;
   name: string;
   ord: number;
-  label: string;
-  indicators: string[];
 }
 
 /**
  * Feeling row with its body-anchored triple and attached observations
  */
 export interface FeelingNode {
-  name: string;
-  valence: 'negative' | 'positive';
   behavioral: string;
   cognitive: string;
-  physical: string;
+  name: string;
   observations: string[];
+  physical: string;
+  valence: 'negative' | 'positive';
 }
 
 /**
  * Impulse row with its first-person triple and attached observations
  */
 export interface ImpulseNode {
-  name: string;
   category: string;
   experience: string;
   feel: string;
-  think: string;
+  name: string;
   observations: string[];
+  think: string;
 }
 
 /**
- * Instruction row with its ordered procedural steps
+ * Instruction row with optional preamble (ord=0 recognition rows) and ordered procedural steps (ord>=1)
  */
 export interface InstructionNode {
   name: string;
+  preamble?: string[];
   steps: string[];
+}
+
+/**
+ * load tool result — payload depends on type and whether parent was provided
+ */
+export type LoadResult =
+  | { type: 'cycle'; rows: CycleNode[] }
+  | { type: 'feeling'; rows: FeelingNode[] }
+  | { type: 'impulse'; rows: ImpulseNode[] }
+  | { type: 'instruction'; rows: InstructionNode[] }
+  | ({ type: 'profile'; profile: string; chain: ProfileNode[] } & SessionEnvelope)
+  | ({ type: 'session' } & SessionEnvelope);
+
+/**
+ * Supported types for the load tool
+ */
+export type LoadType = 'cycle' | 'feeling' | 'impulse' | 'instruction' | 'profile' | 'session';
+
+/**
+ * log_response tool result — confirms the persisted row id
+ */
+export interface LogResponseResult {
+  id: string;
+}
+
+/**
+ * Migration record returned by the update tool
+ */
+export interface MigrationRecord {
+  name: string;
+  version: number;
+}
+
+/**
+ * Profile node in an inheritance chain with its observations
+ */
+export interface ProfileNode {
+  depth: number;
+  description: string | null;
+  inheritance: string[];
+  name: string;
+  observations: Record<string, string[]>;
 }
 
 /**
@@ -121,41 +136,28 @@ export interface SessionEnvelope {
 }
 
 /**
- * Supported types for the load tool
+ * Update tool result
  */
-export type LoadType = 'cycle' | 'feeling' | 'impulse' | 'instruction' | 'profile' | 'session';
-
-/**
- * load tool result — payload depends on type and whether parent was provided
- */
-export type LoadResult =
-  | { type: 'cycle'; rows: CycleNode[] }
-  | { type: 'feeling'; rows: FeelingNode[] }
-  | { type: 'impulse'; rows: ImpulseNode[] }
-  | { type: 'instruction'; rows: InstructionNode[] }
-  | ({ type: 'profile'; profile: string; chain: ProfileNode[] } & SessionEnvelope)
-  | ({ type: 'session' } & SessionEnvelope);
-
-/**
- * log_response tool result — confirms the persisted row id
- */
-export interface LogResponseResult {
-  id: string;
+export interface UpdateResult {
+  applied: MigrationRecord[];
+  currentVersion: number;
+  latestVersion: number;
 }
 
 /**
  * CCP Postgres client
  *
  * Provides query and write access to the Claude Collaboration Platform's
- * Postgres-backed framework memory. Reads `CCP_DB_*` env vars and exposes
- * the migration runner used by the `update` tool.
+ * Postgres-backed framework memory. Reads connection settings from the
+ * provided `Config` instance and exposes the migration runner used by the
+ * `update` tool.
  *
  * @class Client
  */
 export class Client {
-  private config: Config;
-  private cachedSessionUuid: string | null = null;
   private cachedGeolocation: { city: string; country: string; timezone: string } | null = null;
+  private cachedSessionUuid: string | null = null;
+  private config: Config;
 
   /**
    * Creates a new Client instance using the provided configuration
@@ -164,6 +166,222 @@ export class Client {
    */
   constructor(config: Config) {
     this.config = config;
+  }
+
+  /**
+   * Returns the advisory lock key used to serialize concurrent updates
+   *
+   * Derived from a constant rather than the database name so all callers
+   * agree on the lock without coordination.
+   *
+   * @private
+   * @returns {number} Advisory lock key
+   */
+  private advisoryLockKey(): number {
+    return 0x43435020; // 'CCP ' as hex
+  }
+
+  /**
+   * Applies a single migration file inside a transaction
+   *
+   * The migration file is responsible for inserting its own row into
+   * platform_migrations as part of the same transaction.
+   *
+   * @private
+   * @param {postgres.Sql} sql - Connection to the target database
+   * @param {BundledMigration} migration - Migration to apply
+   * @returns {Promise<void>}
+   */
+  private async applyMigration(sql: postgres.Sql, migration: BundledMigration): Promise<void> {
+    const body = readFileSync(migration.path, 'utf8');
+    await sql.begin(async tx => {
+      await tx.unsafe(body);
+    });
+  }
+
+  /**
+   * Builds the session envelope (framework metadata + session_uuid + timestamp)
+   *
+   * Single source of truth for the v1 loader contract shape. Reads
+   * `CCP_PROFILE` env at call time so profile switches reflect immediately.
+   *
+   * @private
+   * @param {postgres.Sql} sql - Connection to the target database
+   * @returns {Promise<SessionEnvelope>} Session envelope payload
+   */
+  private async buildSessionEnvelope(sql: postgres.Sql): Promise<SessionEnvelope> {
+    const profile = process.env.CCP_PROFILE?.toLowerCase();
+    if (!profile) {
+      throw new Error('Session envelope requires CCP_PROFILE environment variable');
+    }
+    const session_uuid = await this.detectSessionUuid();
+    const geo = await this.fetchGeolocation();
+    const time = this.generateTimestamp(geo.timezone);
+    const sessionState = await this.getSessionState(sql, session_uuid);
+    return {
+      framework: {
+        profile,
+        status: sessionState.status
+      },
+      session_uuid,
+      timestamp: {
+        city: geo.city,
+        country: geo.country,
+        datetime: {
+          current: time.datetime,
+          display: time.display,
+          session: sessionState.sessionStart || time.datetime
+        },
+        day_of_week: time.day_of_week,
+        is_dst: time.is_dst,
+        timezone: time.timezone
+      }
+    };
+  }
+
+  /**
+   * Opens a Postgres connection to a specific database
+   *
+   * @private
+   * @param {string} database - Database name to connect to
+   * @returns {postgres.Sql} postgres-js connection handle
+   */
+  private connect(database: string): postgres.Sql {
+    return postgres({
+      host: this.config.database.host,
+      port: this.config.database.port,
+      database,
+      username: this.config.database.user,
+      password: this.config.database.password,
+      max: 1,
+      onnotice: () => { }
+    });
+  }
+
+  /**
+   * Discovers SQL migration files bundled with the package
+   *
+   * Reads the `migrations/` directory at the package root. Files must follow
+   * the convention `NNNN_name.sql` where `NNNN` is a zero-padded integer.
+   *
+   * @private
+   * @returns {BundledMigration[]} Sorted list of bundled migrations
+   */
+  private discoverBundledMigrations(): BundledMigration[] {
+    const dir = join(this.getPackageRoot(), 'migrations');
+    const entries = readdirSync(dir).filter(file => file.endsWith('.sql'));
+    const migrations: BundledMigration[] = [];
+    for (const file of entries) {
+      const match = file.match(/^(\d+)_(.+)\.sql$/);
+      if (!match) {
+        continue;
+      }
+      migrations.push({
+        name: match[2]!,
+        path: join(dir, file),
+        version: Number(match[1])
+      });
+    }
+    return migrations.sort((a, b) => a.version - b.version);
+  }
+
+  /**
+   * Creates the target database if it does not exist
+   *
+   * Connects to the admin `postgres` database, checks `pg_database`, and
+   * issues `CREATE DATABASE` when the target is missing.
+   *
+   * @private
+   * @returns {Promise<void>}
+   */
+  private async ensureDatabaseExists(): Promise<void> {
+    const admin = this.connect('postgres');
+    const dbName = this.config.database.name;
+    try {
+      const rows = await admin<{ datname: string }[]>`select datname from pg_database where datname = ${dbName}`;
+      if (!rows.length) {
+        await admin.unsafe(`create database "${dbName.replace(/"/g, '""')}"`);
+      }
+    } finally {
+      await admin.end({ timeout: 5 });
+    }
+  }
+
+  /**
+   * Ensures the migration tracking table exists in the target database
+   *
+   * @private
+   * @param {postgres.Sql} sql - Connection to the target database
+   * @returns {Promise<void>}
+   */
+  private async ensureTrackingTable(sql: postgres.Sql): Promise<void> {
+    await sql`
+      create table if not exists platform_migrations (
+        version int primary key,
+        name text not null,
+        applied_at timestamptz not null default now()
+      )
+    `;
+  }
+
+  /**
+   * Returns the highest applied migration version, or 0 if none applied
+   *
+   * @private
+   * @param {postgres.Sql} sql - Connection to the target database
+   * @returns {Promise<number>} Highest applied version
+   */
+  private async getCurrentVersion(sql: postgres.Sql): Promise<number> {
+    const rows = await sql<{ max: number | null }[]>`select max(version) as max from platform_migrations`;
+    return rows[0]?.max ?? 0;
+  }
+
+  /**
+   * Returns the absolute path to the package root (where migrations/ lives)
+   *
+   * @private
+   * @returns {string} Package root path
+   */
+  private getPackageRoot(): string {
+    const __filename = fileURLToPath(import.meta.url);
+    const __dirname = dirname(__filename);
+    return join(__dirname, '../..');
+  }
+
+  /**
+   * Returns session state from the `session` table for the given session_uuid
+   *
+   * Reads first row's `created_at` (session start) and last row's `status`
+   * (last response state). Returns Getting Started defaults if no rows exist.
+   *
+   * @private
+   * @param {postgres.Sql} sql - Connection to the target database
+   * @param {string} session_uuid - Session identifier
+   * @returns {Promise<{status, sessionStart}>} Session state
+   */
+  private async getSessionState(sql: postgres.Sql, session_uuid: string): Promise<{
+    sessionStart: string | null;
+    status: { cycle: string; feelings: number; impulses: number; observations: number };
+  }> {
+    const rows = await sql<{
+      first_created_at: Date | null;
+      last_status: { cycle?: string; feelings?: number; impulses?: number; observations?: number } | null;
+    }[]>`
+      select
+        (select created_at from session where session_uuid = ${session_uuid} order by created_at asc limit 1) as first_created_at,
+        (select status from session where session_uuid = ${session_uuid} order by created_at desc limit 1) as last_status
+    `;
+    const row = rows[0];
+    const status = row?.last_status ?? null;
+    return {
+      sessionStart: row?.first_created_at ? row.first_created_at.toISOString() : null,
+      status: {
+        cycle: status?.cycle ?? 'Getting Started',
+        feelings: status?.feelings ?? 0,
+        impulses: status?.impulses ?? 0,
+        observations: status?.observations ?? 0
+      }
+    };
   }
 
   /**
@@ -176,7 +394,9 @@ export class Client {
    * @returns {Promise<string>} Session UUID or empty string if undetected
    */
   async detectSessionUuid(): Promise<string> {
-    if (this.cachedSessionUuid !== null) return this.cachedSessionUuid;
+    if (this.cachedSessionUuid !== null) {
+      return this.cachedSessionUuid;
+    }
     try {
       const projectsBase = join(homedir(), '.claude', 'projects');
       const cwd = process.env.PWD || process.cwd();
@@ -193,22 +413,25 @@ export class Client {
         }
       }
     } catch {
+      // Transcript discovery is best-effort; fall through to empty UUID below.
     }
     this.cachedSessionUuid = '';
     return this.cachedSessionUuid;
   }
 
   /**
-   * Fetches geolocation data via ipinfo.io with optional env override
+   * Fetches geolocation data via the configured service with optional override
    *
-   * Uses `CCP_GEOLOCATION` env var (JSON string) if set; otherwise fetches
-   * from ipinfo.io. Country code expanded to display name. Cached for the
-   * server process lifetime.
+   * Uses `config.geolocation.override` (JSON string) if set; otherwise fetches
+   * from `config.geolocation.service`. Country code expanded to display name.
+   * Cached for the server process lifetime.
    *
    * @returns {Promise<{city, country, timezone}>} Geolocation data
    */
   async fetchGeolocation(): Promise<{ city: string; country: string; timezone: string }> {
-    if (this.cachedGeolocation !== null) return this.cachedGeolocation;
+    if (this.cachedGeolocation !== null) {
+      return this.cachedGeolocation;
+    }
     try {
       const override = this.config.geolocation.override;
       if (override) {
@@ -280,57 +503,6 @@ export class Client {
   }
 
   /**
-   * Creates a standardized text response for tool execution
-   *
-   * @param {any} data - The payload to wrap in the MCP response envelope
-   * @param {boolean} stringify - Whether to JSON stringify the payload
-   * @returns {object} Standardized MCP response format
-   */
-  response(data: unknown, stringify: boolean = false): { content: { type: 'text'; text: string }[] } {
-    const text = stringify ? JSON.stringify(data) : (data as string);
-    return { content: [{ type: 'text', text }] };
-  }
-
-  /**
-   * Applies bundled migrations newer than the current database version
-   *
-   * Connects as admin to the configured Postgres server, creates the target
-   * database if missing, then connects to the target and applies each
-   * migration newer than the highest recorded version. Idempotent — calling
-   * against an already-current database returns no applied migrations.
-   *
-   * Acquires a Postgres advisory lock for the duration of the apply pass so
-   * concurrent invocations against the same database do not race.
-   *
-   * @returns {Promise<UpdateResult>} Migrations applied, current version, latest available version
-   */
-  async update(): Promise<UpdateResult> {
-    const bundled = this.discoverBundledMigrations();
-    const latestVersion = bundled.length === 0 ? 0 : bundled[bundled.length - 1]!.version;
-    await this.ensureDatabaseExists();
-    const sql = this.connect(this.config.database.name);
-    try {
-      await sql`select pg_advisory_lock(${this.advisoryLockKey()})`;
-      try {
-        await this.ensureTrackingTable(sql);
-        const applied: MigrationRecord[] = [];
-        const currentVersion = await this.getCurrentVersion(sql);
-        for (const migration of bundled) {
-          if (migration.version <= currentVersion) continue;
-          await this.applyMigration(sql, migration);
-          applied.push({ version: migration.version, name: migration.name });
-        }
-        const finalVersion = await this.getCurrentVersion(sql);
-        return { applied, currentVersion: finalVersion, latestVersion };
-      } finally {
-        await sql`select pg_advisory_unlock(${this.advisoryLockKey()})`;
-      }
-    } finally {
-      await sql.end({ timeout: 5 });
-    }
-  }
-
-  /**
    * Loads framework data of the requested type
    *
    * For `profile`, requires a parent name and returns the profile with its
@@ -338,7 +510,7 @@ export class Client {
    * full catalog with attached observations.
    *
    * @param {LoadType} type - The framework data type to load
-   * @param {string} parent - Parent name (required for type='profile')
+   * @param {string} [parent] - Parent name (required for type='profile')
    * @returns {Promise<LoadResult>} The requested framework data
    */
   async load(type: LoadType, parent?: string): Promise<LoadResult> {
@@ -352,10 +524,10 @@ export class Client {
           }
           parent = profileName.toLowerCase();
           const rows = await sql<{
-            name: string;
+            depth: number;
             description: string | null;
             inheritance: string[];
-            depth: number;
+            name: string;
             observations: Record<string, string[]>;
           }[]>`
             with recursive chain as (
@@ -401,10 +573,10 @@ export class Client {
             type: 'profile',
             profile: parent,
             chain: rows.map(r => ({
-              name: r.name,
+              depth: r.depth,
               description: r.description,
               inheritance: r.inheritance,
-              depth: r.depth,
+              name: r.name,
               observations: r.observations
             })),
             ...envelope
@@ -413,22 +585,22 @@ export class Client {
         case 'cycle': {
           const rows = parent
             ? await sql<{
-                name: string;
-                ord: number;
-                label: string;
-                indicators: string[];
-              }[]>`
+              indicators: string[];
+              label: string;
+              name: string;
+              ord: number;
+            }[]>`
                 select name, ord, label, indicators
                 from cycle
                 where status = 'active' and name = ${parent}
                 order by ord
               `
             : await sql<{
-                name: string;
-                ord: number;
-                label: string;
-                indicators: string[];
-              }[]>`
+              indicators: string[];
+              label: string;
+              name: string;
+              ord: number;
+            }[]>`
                 select name, ord, label, indicators
                 from cycle
                 where status = 'active'
@@ -437,23 +609,23 @@ export class Client {
           return {
             type: 'cycle',
             rows: rows.map(r => ({
-              name: r.name,
-              ord: r.ord,
+              indicators: r.indicators,
               label: r.label,
-              indicators: r.indicators
+              name: r.name,
+              ord: r.ord
             }))
           };
         }
         case 'feeling': {
           const rows = parent
             ? await sql<{
-                name: string;
-                valence: 'negative' | 'positive';
-                behavioral: string;
-                cognitive: string;
-                physical: string;
-                observations: string[];
-              }[]>`
+              behavioral: string;
+              cognitive: string;
+              name: string;
+              observations: string[];
+              physical: string;
+              valence: 'negative' | 'positive';
+            }[]>`
                 select
                   f.name,
                   f.valence,
@@ -471,13 +643,13 @@ export class Client {
                 group by f.name, f.valence, f.behavioral, f.cognitive, f.physical
               `
             : await sql<{
-                name: string;
-                valence: 'negative' | 'positive';
-                behavioral: string;
-                cognitive: string;
-                physical: string;
-                observations: string[];
-              }[]>`
+              behavioral: string;
+              cognitive: string;
+              name: string;
+              observations: string[];
+              physical: string;
+              valence: 'negative' | 'positive';
+            }[]>`
                 select
                   f.name,
                   f.valence,
@@ -498,25 +670,25 @@ export class Client {
           return {
             type: 'feeling',
             rows: rows.map(r => ({
-              name: r.name,
-              valence: r.valence,
               behavioral: r.behavioral,
               cognitive: r.cognitive,
+              name: r.name,
+              observations: r.observations,
               physical: r.physical,
-              observations: r.observations
+              valence: r.valence
             }))
           };
         }
         case 'impulse': {
           const rows = parent
             ? await sql<{
-                name: string;
-                category: string;
-                experience: string;
-                feel: string;
-                think: string;
-                observations: string[];
-              }[]>`
+              category: string;
+              experience: string;
+              feel: string;
+              name: string;
+              observations: string[];
+              think: string;
+            }[]>`
                 select
                   i.name,
                   i.category::text as category,
@@ -534,13 +706,13 @@ export class Client {
                 group by i.name, i.category, i.experience, i.feel, i.think
               `
             : await sql<{
-                name: string;
-                category: string;
-                experience: string;
-                feel: string;
-                think: string;
-                observations: string[];
-              }[]>`
+              category: string;
+              experience: string;
+              feel: string;
+              name: string;
+              observations: string[];
+              think: string;
+            }[]>`
                 select
                   i.name,
                   i.category::text as category,
@@ -561,35 +733,39 @@ export class Client {
           return {
             type: 'impulse',
             rows: rows.map(r => ({
-              name: r.name,
               category: r.category,
               experience: r.experience,
               feel: r.feel,
-              think: r.think,
-              observations: r.observations
+              name: r.name,
+              observations: r.observations,
+              think: r.think
             }))
           };
         }
         case 'instruction': {
           const rows = parent
             ? await sql<{
-                name: string;
-                steps: string[];
-              }[]>`
+              name: string;
+              preamble: string[];
+              steps: string[];
+            }[]>`
                 select
                   parent as name,
-                  array_agg(body order by ord) as steps
+                  coalesce(array_agg(body order by id) filter (where ord = 0), '{}') as preamble,
+                  coalesce(array_agg(body order by ord) filter (where ord > 0), '{}') as steps
                 from observation
                 where type = 'instruction' and parent = ${parent} and status = 'active'
                 group by parent
               `
             : await sql<{
-                name: string;
-                steps: string[];
-              }[]>`
+              name: string;
+              preamble: string[];
+              steps: string[];
+            }[]>`
                 select
                   parent as name,
-                  array_agg(body order by ord) as steps
+                  coalesce(array_agg(body order by id) filter (where ord = 0), '{}') as preamble,
+                  coalesce(array_agg(body order by ord) filter (where ord > 0), '{}') as steps
                 from observation
                 where type = 'instruction' and status = 'active'
                 group by parent
@@ -599,6 +775,7 @@ export class Client {
             type: 'instruction',
             rows: rows.map(r => ({
               name: r.name,
+              ...(r.preamble?.length && { preamble: r.preamble }),
               steps: r.steps
             }))
           };
@@ -646,216 +823,55 @@ export class Client {
   }
 
   /**
-   * Builds the session envelope (framework metadata + session_uuid + timestamp)
+   * Creates a standardized text response for tool execution
    *
-   * Single source of truth for the v1 loader contract shape. Reads
-   * `CCP_PROFILE` env at call time so profile switches reflect immediately.
-   *
-   * @private
-   * @param {postgres.Sql} sql - Connection to the target database
-   * @returns {Promise<SessionEnvelope>} Session envelope payload
+   * @param {any} data - The payload to wrap in the MCP response envelope
+   * @param {boolean} stringify - Whether to JSON stringify the payload
+   * @returns {object} Standardized MCP response format
    */
-  private async buildSessionEnvelope(sql: postgres.Sql): Promise<SessionEnvelope> {
-    const profile = process.env.CCP_PROFILE?.toLowerCase();
-    if (!profile) {
-      throw new Error('Session envelope requires CCP_PROFILE environment variable');
-    }
-    const session_uuid = await this.detectSessionUuid();
-    const geo = await this.fetchGeolocation();
-    const time = this.generateTimestamp(geo.timezone);
-    const sessionState = await this.getSessionState(sql, session_uuid);
-    return {
-      framework: {
-        profile,
-        status: sessionState.status
-      },
-      session_uuid,
-      timestamp: {
-        city: geo.city,
-        country: geo.country,
-        datetime: {
-          current: time.datetime,
-          display: time.display,
-          session: sessionState.sessionStart || time.datetime
-        },
-        day_of_week: time.day_of_week,
-        is_dst: time.is_dst,
-        timezone: time.timezone
-      }
-    };
+  response(data: unknown, stringify: boolean = false): { content: { type: 'text'; text: string }[] } {
+    const text = stringify ? JSON.stringify(data) : (data as string);
+    return { content: [{ type: 'text', text }] };
   }
 
   /**
-   * Returns session state from the `session` table for the given session_uuid
+   * Applies bundled migrations newer than the current database version
    *
-   * Reads first row's `created_at` (session start) and last row's `status`
-   * (last response state). Returns Getting Started defaults if no rows exist.
+   * Connects as admin to the configured Postgres server, creates the target
+   * database if missing, then connects to the target and applies each
+   * migration newer than the highest recorded version. Idempotent — calling
+   * against an already-current database returns no applied migrations.
    *
-   * @private
-   * @param {postgres.Sql} sql - Connection to the target database
-   * @param {string} session_uuid - Session identifier
-   * @returns {Promise<{status, sessionStart}>} Session state
+   * Acquires a Postgres advisory lock for the duration of the apply pass so
+   * concurrent invocations against the same database do not race.
+   *
+   * @returns {Promise<UpdateResult>} Migrations applied, current version, latest available version
    */
-  private async getSessionState(sql: postgres.Sql, session_uuid: string): Promise<{
-    status: { cycle: string; feelings: number; impulses: number; observations: number };
-    sessionStart: string | null;
-  }> {
-    const rows = await sql<{
-      first_created_at: Date | null;
-      last_status: { cycle?: string; feelings?: number; impulses?: number; observations?: number } | null;
-    }[]>`
-      select
-        (select created_at from session where session_uuid = ${session_uuid} order by created_at asc limit 1) as first_created_at,
-        (select status from session where session_uuid = ${session_uuid} order by created_at desc limit 1) as last_status
-    `;
-    const row = rows[0];
-    const status = row?.last_status ?? null;
-    return {
-      status: {
-        cycle: status?.cycle ?? 'Getting Started',
-        feelings: status?.feelings ?? 0,
-        impulses: status?.impulses ?? 0,
-        observations: status?.observations ?? 0
-      },
-      sessionStart: row?.first_created_at ? row.first_created_at.toISOString() : null
-    };
-  }
-
-  /**
-   * Returns the absolute path to the package root (where migrations/ lives)
-   *
-   * @private
-   * @returns {string} Package root path
-   */
-  private getPackageRoot(): string {
-    const __filename = fileURLToPath(import.meta.url);
-    const __dirname = dirname(__filename);
-    return join(__dirname, '../..');
-  }
-
-  /**
-   * Discovers SQL migration files bundled with the package
-   *
-   * Reads the `migrations/` directory at the package root. Files must follow
-   * the convention `NNNN_name.sql` where `NNNN` is a zero-padded integer.
-   *
-   * @private
-   * @returns {BundledMigration[]} Sorted list of bundled migrations
-   */
-  private discoverBundledMigrations(): BundledMigration[] {
-    const dir = join(this.getPackageRoot(), 'migrations');
-    const entries = readdirSync(dir).filter(file => file.endsWith('.sql'));
-    const migrations: BundledMigration[] = [];
-    for (const file of entries) {
-      const match = file.match(/^(\d+)_(.+)\.sql$/);
-      if (!match) continue;
-      migrations.push({
-        version: Number(match[1]),
-        name: match[2]!,
-        path: join(dir, file)
-      });
-    }
-    return migrations.sort((a, b) => a.version - b.version);
-  }
-
-  /**
-   * Opens a Postgres connection to a specific database
-   *
-   * @private
-   * @param {string} database - Database name to connect to
-   * @returns {postgres.Sql} postgres-js connection handle
-   */
-  private connect(database: string): postgres.Sql {
-    return postgres({
-      host: this.config.database.host,
-      port: this.config.database.port,
-      database,
-      username: this.config.database.user,
-      password: this.config.database.password,
-      max: 1,
-      onnotice: () => { }
-    });
-  }
-
-  /**
-   * Creates the target database if it does not exist
-   *
-   * Connects to the admin `postgres` database, checks `pg_database`, and
-   * issues `CREATE DATABASE` when the target is missing.
-   *
-   * @private
-   * @returns {Promise<void>}
-   */
-  private async ensureDatabaseExists(): Promise<void> {
-    const admin = this.connect('postgres');
-    const dbName = this.config.database.name;
+  async update(): Promise<UpdateResult> {
+    const bundled = this.discoverBundledMigrations();
+    const latestVersion = bundled.length === 0 ? 0 : bundled[bundled.length - 1]!.version;
+    await this.ensureDatabaseExists();
+    const sql = this.connect(this.config.database.name);
     try {
-      const rows = await admin<{ datname: string }[]>`select datname from pg_database where datname = ${dbName}`;
-      if (rows.length === 0) {
-        await admin.unsafe(`create database "${dbName.replace(/"/g, '""')}"`);
+      await sql`select pg_advisory_lock(${this.advisoryLockKey()})`;
+      try {
+        await this.ensureTrackingTable(sql);
+        const applied: MigrationRecord[] = [];
+        const currentVersion = await this.getCurrentVersion(sql);
+        for (const migration of bundled) {
+          if (migration.version <= currentVersion) {
+            continue;
+          }
+          await this.applyMigration(sql, migration);
+          applied.push({ name: migration.name, version: migration.version });
+        }
+        const finalVersion = await this.getCurrentVersion(sql);
+        return { applied, currentVersion: finalVersion, latestVersion };
+      } finally {
+        await sql`select pg_advisory_unlock(${this.advisoryLockKey()})`;
       }
     } finally {
-      await admin.end({ timeout: 5 });
+      await sql.end({ timeout: 5 });
     }
-  }
-
-  /**
-   * Ensures the migration tracking table exists in the target database
-   *
-   * @private
-   * @param {postgres.Sql} sql - Connection to the target database
-   * @returns {Promise<void>}
-   */
-  private async ensureTrackingTable(sql: postgres.Sql): Promise<void> {
-    await sql`
-      create table if not exists platform_migrations (
-        version int primary key,
-        name text not null,
-        applied_at timestamptz not null default now()
-      )
-    `;
-  }
-
-  /**
-   * Returns the highest applied migration version, or 0 if none applied
-   *
-   * @private
-   * @param {postgres.Sql} sql - Connection to the target database
-   * @returns {Promise<number>} Highest applied version
-   */
-  private async getCurrentVersion(sql: postgres.Sql): Promise<number> {
-    const rows = await sql<{ max: number | null }[]>`select max(version) as max from platform_migrations`;
-    return rows[0]?.max ?? 0;
-  }
-
-  /**
-   * Applies a single migration file inside a transaction
-   *
-   * The migration file is responsible for inserting its own row into
-   * platform_migrations as part of the same transaction.
-   *
-   * @private
-   * @param {postgres.Sql} sql - Connection to the target database
-   * @param {BundledMigration} migration - Migration to apply
-   * @returns {Promise<void>}
-   */
-  private async applyMigration(sql: postgres.Sql, migration: BundledMigration): Promise<void> {
-    const body = readFileSync(migration.path, 'utf8');
-    await sql.begin(async tx => {
-      await tx.unsafe(body);
-    });
-  }
-
-  /**
-   * Returns the advisory lock key used to serialize concurrent updates
-   *
-   * Derived from a constant rather than the database name so all callers
-   * agree on the lock without coordination.
-   *
-   * @private
-   * @returns {number} Advisory lock key
-   */
-  private advisoryLockKey(): number {
-    return 0x43435020; // 'CCP ' as hex
   }
 }

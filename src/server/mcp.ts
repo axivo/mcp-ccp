@@ -22,22 +22,18 @@ import { McpTool } from './tool.js';
  * @class Mcp
  */
 export class Mcp {
-  private config: Config;
   private client: Client;
+  private config: Config;
   private server: McpServer;
   private tool: McpTool;
 
   /**
-   * Creates a new Mcp instance with tool setup
-   *
-   * Initializes configuration, Postgres client, MCP server, and registers
-   * every tool with the underlying McpServer registry.
-   */
-  /**
    * Creates a new Mcp instance with the given configuration
    *
    * Configuration is loaded by the entry point (transport-specific) and
-   * passed in. This keeps the server transport-agnostic.
+   * passed in. This keeps the server transport-agnostic. Initializes the
+   * Postgres client, MCP server, tool definitions, and registers every
+   * tool with the underlying McpServer registry.
    *
    * @param {Config} config - Validated CCP configuration
    */
@@ -50,21 +46,6 @@ export class Mcp {
     );
     this.tool = new McpTool();
     this.registerAll();
-  }
-
-  /**
-   * Registers every tool with the McpServer registry
-   *
-   * Each call wires a tool definition from `McpTool` to its handler.
-   * The SDK validates incoming arguments against the tool's `inputSchema`
-   * and (when present) the tool's response against its `outputSchema`.
-   *
-   * @private
-   */
-  private registerAll(): void {
-    this.server.registerTool('load', this.tool.load(), (args) => this.handleLoad(args as { type: 'cycle' | 'feeling' | 'impulse' | 'instruction' | 'profile' | 'session'; parent?: string }));
-    this.server.registerTool('log_response', this.tool.logResponse(), (args) => this.handleLogResponse(args as { id: string; message: string; status: Record<string, unknown> }));
-    this.server.registerTool('update', this.tool.update(), () => this.handleUpdate());
   }
 
   /**
@@ -113,8 +94,23 @@ export class Mcp {
       return this.structured(result as unknown as Record<string, unknown>);
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
-      return this.client.response(`Update failed: ${message}`);
+      return this.client.response(`update failed: ${message}`);
     }
+  }
+
+  /**
+   * Registers every tool with the McpServer registry
+   *
+   * Each call wires a tool definition from `McpTool` to its handler.
+   * The SDK validates incoming arguments against the tool's `inputSchema`
+   * and (when present) the tool's response against its `outputSchema`.
+   *
+   * @private
+   */
+  private registerAll(): void {
+    this.server.registerTool('load', this.tool.load(), (args) => this.handleLoad(args as { type: 'cycle' | 'feeling' | 'impulse' | 'instruction' | 'profile' | 'session'; parent?: string }));
+    this.server.registerTool('log_response', this.tool.logResponse(), (args) => this.handleLogResponse(args as { id: string; message: string; status: Record<string, unknown> }));
+    this.server.registerTool('update', this.tool.update(), () => this.handleUpdate());
   }
 
   /**

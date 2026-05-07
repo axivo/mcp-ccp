@@ -3,7 +3,7 @@
  * CCP MCP Server Entry Point (stdio)
  *
  * Loads configuration from a JSON file (path resolved from `CCP_CONFIG_PATH`
- * env var or `~/.config/ccp/config.json`), validates it, and starts the MCP
+ * env var or `~/.claude/ccp/config.json`), validates it, and starts the MCP
  * server over stdio transport.
  *
  * The HTTP/Worker entry point lives separately and loads configuration from
@@ -14,10 +14,10 @@
  * @license BSD-3-Clause
  */
 
+import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { existsSync, readFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
-import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { Config } from './server/config.js';
 import { Mcp } from './server/mcp.js';
 
@@ -28,9 +28,13 @@ import { Mcp } from './server/mcp.js';
  */
 function resolveConfigPath(): string | null {
   const envPath = process.env.CCP_CONFIG_PATH;
-  if (envPath) return envPath;
-  const defaultPath = join(homedir(), '.config', 'ccp', 'config.json');
-  if (existsSync(defaultPath)) return defaultPath;
+  if (envPath) {
+    return envPath;
+  }
+  const defaultPath = join(homedir(), '.claude', 'ccp', 'config.json');
+  if (existsSync(defaultPath)) {
+    return defaultPath;
+  }
   return null;
 }
 
@@ -44,7 +48,9 @@ function resolveConfigPath(): string | null {
  */
 function loadConfigFromFile(): unknown {
   const path = resolveConfigPath();
-  if (!path || !existsSync(path)) return {};
+  if (!path || !existsSync(path)) {
+    return {};
+  }
   return JSON.parse(readFileSync(path, 'utf-8'));
 }
 
