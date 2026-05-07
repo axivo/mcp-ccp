@@ -9,6 +9,10 @@
 
 A MCP (Model Context Protocol) server for the [Claude Collaboration Platform](https://axivo.com/claude) framework.
 
+> [!NOTE]
+>
+> The collaboration platform is not affiliated with, endorsed by, or sponsored by Anthropic. "Anthropic" and "Claude" are trademarks of Anthropic, PBC. All rights belong to their respective owners.
+
 ### Features
 
 - **Polymorphic Catalog**: Single `observation` table holds bodies for profiles, feelings, impulses, and instructions
