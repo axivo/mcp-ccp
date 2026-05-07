@@ -7,7 +7,7 @@
 [![TypeScript](https://img.shields.io/badge/TypeScript->=6.0.0-3178C6?style=flat&logo=typescript&logoColor=white)](https://www.typescriptlang.org/)
 [![Postgres](https://img.shields.io/badge/Postgres->=15-4169E1?style=flat&logo=postgresql&logoColor=white)](https://www.postgresql.org/)
 
-A MCP (Model Context Protocol) server for the Claude Collaboration Platform's Postgres-backed framework memory.
+A MCP (Model Context Protocol) server for the [Claude Collaboration Platform](https://axivo.com/claude) framework.
 
 ### Features
 
