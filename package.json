@@ -1,0 +1,55 @@
+{
+  "name": "@axivo/mcp-ccp",
+  "version": "0.1.0",
+  "type": "module",
+  "description": "MCP server for the Claude Collaboration Platform",
+  "keywords": [
+    "ccp",
+    "claude",
+    "framework",
+    "mcp",
+    "model-context-protocol",
+    "postgres",
+    "server",
+    "supabase"
+  ],
+  "license": "BSD-3-Clause",
+  "author": "AXIVO",
+  "files": [
+    "dist/**/*",
+    "LICENSE",
+    "migrations/**/*",
+    "README.md"
+  ],
+  "bin": {
+    "mcp-ccp": "dist/index.js"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/axivo/mcp-ccp.git"
+  },
+  "scripts": {
+    "build": "tsc",
+    "clean": "rm -rf dist"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.29.0",
+    "postgres": "^3.4.0",
+    "zod": "^4.4.0"
+  },
+  "devDependencies": {
+    "@types/node": "^25.0.0",
+    "typescript": "^6.0.0"
+  },
+  "engines": {
+    "node": ">=24.0.0"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "main": "index.js",
+  "bugs": {
+    "url": "https://github.com/axivo/mcp-ccp/issues"
+  },
+  "homepage": "https://github.com/axivo/mcp-ccp"
+}
