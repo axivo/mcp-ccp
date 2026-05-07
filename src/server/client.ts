@@ -47,7 +47,7 @@ export interface ProfileNode {
   description: string | null;
   inheritance: string[];
   depth: number;
-  observations: string[];
+  observations: Record<string, string[]>;
 }
 
 /**
@@ -350,13 +350,13 @@ export class Client {
           if (!profileName) {
             throw new Error('load(profile) requires either a parent argument or CCP_PROFILE environment variable');
           }
-          parent = profileName;
+          parent = profileName.toLowerCase();
           const rows = await sql<{
             name: string;
             description: string | null;
             inheritance: string[];
             depth: number;
-            observations: string[];
+            observations: Record<string, string[]>;
           }[]>`
             with recursive chain as (
               select name, description, inheritance, 0 as depth
@@ -372,6 +372,15 @@ export class Client {
               select distinct on (name) name, description, inheritance, depth
               from chain
               order by name, depth
+            ),
+            grouped as (
+              select
+                o.parent,
+                coalesce(o.label, 'context') as label,
+                array_agg(o.body order by o.id) as bodies
+              from observation o
+              where o.type = 'profile' and o.status = 'active'
+              group by o.parent, coalesce(o.label, 'context')
             )
             select
               u.name,
@@ -379,12 +388,11 @@ export class Client {
               u.inheritance,
               u.depth,
               coalesce(
-                array_agg(o.body order by o.ord, o.id) filter (where o.id is not null),
-                '{}'
+                jsonb_object_agg(g.label, g.bodies) filter (where g.label is not null),
+                '{}'::jsonb
               ) as observations
             from uniq u
-            left join observation o
-              on o.type = 'profile' and o.parent = u.name and o.status = 'active'
+            left join grouped g on g.parent = u.name
             group by u.name, u.description, u.inheritance, u.depth
             order by u.depth, u.name
           `;
@@ -648,7 +656,7 @@ export class Client {
    * @returns {Promise<SessionEnvelope>} Session envelope payload
    */
   private async buildSessionEnvelope(sql: postgres.Sql): Promise<SessionEnvelope> {
-    const profile = process.env.CCP_PROFILE;
+    const profile = process.env.CCP_PROFILE?.toLowerCase();
     if (!profile) {
       throw new Error('Session envelope requires CCP_PROFILE environment variable');
     }

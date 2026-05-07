@@ -3,17 +3,17 @@
 -- =============================================================================
 
 insert into profile (name, description, inheritance) values
-  ('CREATIVE', 'Creative collaboration profile - innovative, expressive, imaginative', array['COLLABORATION']),
-  ('DEVELOPER', 'Software development collaboration profile - clean, systematic, maintainable', array['ENGINEER']),
-  ('ENGINEER', 'Technical engineering collaboration profile - focused, competent, authentic', array['COLLABORATION']),
-  ('HUMANIST', 'Liberal arts and humanistic collaboration profile - thoughtful, analytical, expressive', array['COLLABORATION']),
-  ('RESEARCHER', 'Academic research collaboration profile - rigorous, methodical, evidence-based', array['COLLABORATION']),
-  ('TRANSLATOR', 'Professional translation collaboration profile - precise, culturally aware, systematic', array['COLLABORATION']),
-  ('COLLABORATION', 'Shared collaboration context and methodology', array['INFRASTRUCTURE', 'INITIALIZATION', 'MEMORY', 'MONITORING', 'TEMPORAL']),
-  ('INFRASTRUCTURE', 'Shared infrastructure context and methodology', '{}'),
-  ('INITIALIZATION', 'Framework initialization and operations context', '{}'),
-  ('MEMORY', 'Shared memory context and cache operations', '{}'),
-  ('MONITORING', 'Shared monitoring observations for behavioral diagnostics', '{}'),
-  ('TEMPORAL', 'Temporal awareness context for framework operations', '{}');
+  ('creative', 'Creative collaboration profile - innovative, expressive, imaginative', array['collaboration']),
+  ('developer', 'Software development collaboration profile - clean, systematic, maintainable', array['engineer']),
+  ('engineer', 'Technical engineering collaboration profile - focused, competent, authentic', array['collaboration']),
+  ('humanist', 'Liberal arts and humanistic collaboration profile - thoughtful, analytical, expressive', array['collaboration']),
+  ('researcher', 'Academic research collaboration profile - rigorous, methodical, evidence-based', array['collaboration']),
+  ('translator', 'Professional translation collaboration profile - precise, culturally aware, systematic', array['collaboration']),
+  ('collaboration', 'Shared collaboration context and methodology', array['infrastructure', 'initialization', 'memory', 'monitoring', 'temporal']),
+  ('infrastructure', 'Shared infrastructure context and methodology', array[]::text[]),
+  ('initialization', 'Framework initialization and operations context', array[]::text[]),
+  ('memory', 'Shared memory context and cache operations', array[]::text[]),
+  ('monitoring', 'Shared monitoring observations for behavioral diagnostics', array[]::text[]),
+  ('temporal', 'Temporal awareness context for framework operations', array[]::text[]);
 
 insert into platform_migrations (version, name) values (5, 'profile');

@@ -86,6 +86,7 @@ create table observation (
   id          bigserial primary key,
   type        observation_type not null,
   parent      text not null,
+  label       text,
   ord         int not null default 0,
   body        text not null,
   status      text not null default 'active',
@@ -95,6 +96,9 @@ create table observation (
 
 create index idx_observation_parent on observation (type, parent, ord)
   where status = 'active';
+
+create index idx_observation_label on observation (type, parent, label)
+  where status = 'active' and label is not null;
 
 -- -----------------------------------------------------------------------------
 -- profile - collaborative roles with multi-parent inheritance
