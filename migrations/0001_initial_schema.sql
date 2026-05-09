@@ -125,18 +125,34 @@ create table profile (
 );
 
 -- -----------------------------------------------------------------------------
--- session - per-response private writing
+-- session - conversation metadata
 -- -----------------------------------------------------------------------------
 
 create table session (
+  session_uuid  text primary key,
+  title         text,
+  description   text,
+  created_at    timestamptz not null default now(),
+  updated_at    timestamptz not null default now()
+);
+
+-- -----------------------------------------------------------------------------
+-- session_log - per-response private writing
+-- -----------------------------------------------------------------------------
+
+create table session_log (
   id            uuid primary key,
   session_uuid  text not null,
   message       text not null default '',
-  status        jsonb,
+  cycle         text,
+  feeling       text[],
+  impulse       text[],
+  observation   text[],
+  protocol      text,
   created_at    timestamptz not null default now()
 );
 
-create index idx_session_uuid on session (session_uuid, created_at);
+create index idx_session_log_session_uuid on session_log (session_uuid, created_at);
 
 -- -----------------------------------------------------------------------------
 -- project - long-lived container for tasks and team work
