@@ -74,7 +74,7 @@ export type LoadResult =
   | { type: 'impulse'; rows: ImpulseNode[] }
   | { type: 'instruction'; rows: InstructionNode[] }
   | ({ type: 'profile'; profile: string; chain: ProfileNode[] } & SessionEnvelope)
-  | ({ type: 'session' } & SessionEnvelope);
+  | ({ type: 'session'; session: SessionDetail } & SessionEnvelope);
 
 /**
  * Supported types for the load tool
@@ -106,6 +106,31 @@ export interface ProfileNode {
   inheritance: string[];
   name: string;
   observations: Record<string, string[]>;
+}
+
+/**
+ * Session log entry — one row per response captured by the `log` tool
+ */
+export interface SessionLogEntry {
+  id: string;
+  message: string;
+  cycle: string | null;
+  feeling: string[] | null;
+  impulse: string[] | null;
+  observation: string[] | null;
+  protocol: string | null;
+  created_at: string;
+}
+
+/**
+ * Session detail — metadata row plus its log entries
+ */
+export interface SessionDetail {
+  title: string | null;
+  description: string | null;
+  created_at: string | null;
+  updated_at: string | null;
+  log: SessionLogEntry[];
 }
 
 /**
@@ -829,7 +854,50 @@ export class Client {
         }
         case 'session': {
           const envelope = await this.buildSessionEnvelope(sql);
-          return { type: 'session', ...envelope };
+          const target_uuid = parent || envelope.session_uuid;
+          const sessionRows = await sql<{
+            title: string | null;
+            description: string | null;
+            created_at: Date;
+            updated_at: Date;
+          }[]>`
+            select title, description, created_at, updated_at
+            from session
+            where session_uuid = ${target_uuid}
+          `;
+          const logRows = await sql<{
+            id: string;
+            message: string;
+            cycle: string | null;
+            feeling: string[] | null;
+            impulse: string[] | null;
+            observation: string[] | null;
+            protocol: string | null;
+            created_at: Date;
+          }[]>`
+            select id, message, cycle, feeling, impulse, observation, protocol, created_at
+            from session_log
+            where session_uuid = ${target_uuid}
+            order by created_at asc
+          `;
+          const sessionRow = sessionRows[0];
+          const session: SessionDetail = {
+            title: sessionRow?.title ?? null,
+            description: sessionRow?.description ?? null,
+            created_at: sessionRow?.created_at ? sessionRow.created_at.toISOString() : null,
+            updated_at: sessionRow?.updated_at ? sessionRow.updated_at.toISOString() : null,
+            log: logRows.map(r => ({
+              id: r.id,
+              message: r.message,
+              cycle: r.cycle,
+              feeling: r.feeling,
+              impulse: r.impulse,
+              observation: r.observation,
+              protocol: r.protocol,
+              created_at: r.created_at.toISOString()
+            }))
+          };
+          return { type: 'session', session, ...envelope };
         }
       }
     } finally {

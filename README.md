@@ -106,7 +106,7 @@ Call `status` first at session start to discover the tool surface. Call `update`
      - `impulse` → `{ type, rows: [{ name, category, experience, feel, think, observations }] }`
      - `instruction` → `{ type, rows: [{ name, preamble?, steps }] }` — `preamble` omitted when no ord=0 rows exist; `steps` is an object keyed by step number (`{ "1": "...", "2": "..." }`)
      - `profile` → `{ type, profile, chain, framework, session_uuid, timestamp }` — full inheritance chain via recursive CTE plus session envelope
-     - `session` → `{ type, framework, session_uuid, timestamp }` — session envelope only
+     - `session` → `{ type, session, framework, session_uuid, timestamp }` — envelope plus `session: { title, description, created_at, updated_at, log: [{ id, message, cycle, feeling, impulse, observation, protocol, created_at }] }`. With `parent` argument, returns the named session's metadata and log entries; without, returns the active session.
 
 2. `log`
    - Persist a per-response `session_log` row capturing the instance's first-person prose and detection lists, return rendered status block ready to display
