@@ -8,6 +8,7 @@
 
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
+import { z } from 'zod';
 import { Client } from './client.js';
 import { Config } from './config.js';
 import { McpTool } from './tool.js';
@@ -49,6 +50,45 @@ export class Mcp {
   }
 
   /**
+   * Returns all tool definitions in a wire-friendly shape for the status tool
+   *
+   * Iterates every registered tool, converts each Zod input/output schema to
+   * JSON Schema for portability, and lifts `_meta.usage` to a top-level `usage`
+   * field for ergonomic consumption.
+   *
+   * @private
+   * @returns {object[]} Array of tool definitions
+   */
+  private getToolDefinitions(): Record<string, unknown>[] {
+    const entries: { name: string; config: Record<string, unknown> }[] = [
+      { name: 'load', config: this.tool.load() },
+      { name: 'log_response', config: this.tool.logResponse() },
+      { name: 'status', config: this.tool.status() },
+      { name: 'update', config: this.tool.update() }
+    ];
+    return entries.map(({ name, config }) => {
+      const definition: Record<string, unknown> = {
+        name,
+        description: config.description ?? ''
+      };
+      if (config.inputSchema && Object.keys(config.inputSchema as Record<string, unknown>).length > 0) {
+        definition.inputSchema = z.toJSONSchema(z.object(config.inputSchema as z.ZodRawShape));
+      }
+      if (config.outputSchema && Object.keys(config.outputSchema as Record<string, unknown>).length > 0) {
+        definition.outputSchema = z.toJSONSchema(z.object(config.outputSchema as z.ZodRawShape));
+      }
+      if (config.annotations) {
+        definition.annotations = config.annotations;
+      }
+      const meta = config._meta as { usage?: string[] } | undefined;
+      if (meta?.usage) {
+        definition.usage = meta.usage;
+      }
+      return definition;
+    });
+  }
+
+  /**
    * Handles the load tool — fetches framework data of the given type
    *
    * @private
@@ -83,6 +123,23 @@ export class Mcp {
   }
 
   /**
+   * Handles the status tool — returns the full tool surface with usage
+   *
+   * @private
+   * @returns {Promise<any>} Tool execution response
+   */
+  private async handleStatus() {
+    try {
+      const database = await this.client.status();
+      const tools = this.getToolDefinitions();
+      return this.structured({ database, tools });
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      return this.client.response(`status failed: ${message}`);
+    }
+  }
+
+  /**
    * Handles the update tool — applies any pending migrations
    *
    * @private
@@ -110,6 +167,7 @@ export class Mcp {
   private registerAll(): void {
     this.server.registerTool('load', this.tool.load(), (args) => this.handleLoad(args as { type: 'cycle' | 'feeling' | 'impulse' | 'instruction' | 'profile' | 'session'; parent?: string }));
     this.server.registerTool('log_response', this.tool.logResponse(), (args) => this.handleLogResponse(args as { message: string; status: { cycle: string; feelings: number; impulses: number; observations: number; protocol: string } }));
+    this.server.registerTool('status', this.tool.status(), () => this.handleStatus());
     this.server.registerTool('update', this.tool.update(), () => this.handleUpdate());
   }
 

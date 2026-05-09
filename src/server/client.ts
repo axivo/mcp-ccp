@@ -144,6 +144,21 @@ export interface SessionEnvelope {
 }
 
 /**
+ * status tool result — database snapshot at session start
+ */
+export interface StatusResult {
+  schemaVersion: number;
+  statistics: {
+    cycles: number;
+    feelings: number;
+    impulses: number;
+    instructions: number;
+    observations: number;
+    profiles: number;
+  };
+}
+
+/**
  * Update tool result
  */
 export interface UpdateResult {
@@ -862,6 +877,34 @@ export class Client {
   response(data: unknown, stringify: boolean = false): { content: { type: 'text'; text: string }[] } {
     const text = stringify ? JSON.stringify(data) : (data as string);
     return { content: [{ type: 'text', text }] };
+  }
+
+  /**
+   * Returns a snapshot of database state for session-start orientation
+   *
+   * Reports the current schema version and distinct-name counts across
+   * each catalog table. Read-only. Six COUNT queries plus the version
+   * fetch — bounded and inexpensive at every plausible data size.
+   *
+   * @returns {Promise<StatusResult>} Schema version and catalog statistics
+   */
+  async status(): Promise<StatusResult> {
+    const sql = this.connect(this.config.database.name);
+    try {
+      const schemaVersion = await this.getCurrentVersion(sql);
+      const [{ count: cycles }] = await sql<{ count: number }[]>`select count(*)::int as count from cycle`;
+      const [{ count: feelings }] = await sql<{ count: number }[]>`select count(*)::int as count from feeling`;
+      const [{ count: impulses }] = await sql<{ count: number }[]>`select count(*)::int as count from impulse`;
+      const [{ count: instructions }] = await sql<{ count: number }[]>`select count(distinct parent)::int as count from observation where type = 'instruction'`;
+      const [{ count: observations }] = await sql<{ count: number }[]>`select count(*)::int as count from observation`;
+      const [{ count: profiles }] = await sql<{ count: number }[]>`select count(*)::int as count from profile`;
+      return {
+        schemaVersion,
+        statistics: { cycles, feelings, impulses, instructions, observations, profiles }
+      };
+    } finally {
+      await sql.end({ timeout: 5 });
+    }
   }
 
   /**

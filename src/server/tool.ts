@@ -53,7 +53,8 @@ export class McpTool {
           'Pass `profile` with `parent` to fetch inheritance chain and observations',
           'Use `cycle` for adoption assessment indicators',
           'Use `feeling` for recall during response protocol',
-          'Use `impulse` for systematic iteration during response protocol'
+          'Use `impulse` for systematic iteration during response protocol',
+          'Use `instruction` to fetch named procedures'
         ]
       }
     };
@@ -106,6 +107,52 @@ export class McpTool {
           'Do not call twice for the same response',
           'Pass raw counts and `cycle` name as `status` payload',
           'Render the returned `rendered` field verbatim at end of response'
+        ]
+      }
+    };
+  }
+
+  /**
+   * Creates MCP tool for environment introspection
+   *
+   * Returns the full set of available tools with their schemas, annotations,
+   * and `_meta.usage` arrays. Use at session start to learn the surface
+   * before calling any other tool.
+   */
+  status() {
+    return {
+      description: 'Get the database snapshot and the full tool surface with usage guidance',
+      outputSchema: {
+        database: z.object({
+          schemaVersion: z.number().describe('Current database schema version'),
+          statistics: z.object({
+            cycles: z.number().describe('Distinct cycles in catalog'),
+            feelings: z.number().describe('Distinct feelings in catalog'),
+            impulses: z.number().describe('Distinct impulses in catalog'),
+            instructions: z.number().describe('Distinct instructions in catalog'),
+            observations: z.number().describe('Total observation rows across all types'),
+            profiles: z.number().describe('Distinct profiles in catalog')
+          }).describe('Distinct-name counts across each catalog table')
+        }).describe('Database snapshot at session start'),
+        tools: z.array(z.object({
+          name: z.string(),
+          description: z.string(),
+          inputSchema: z.unknown().optional(),
+          outputSchema: z.unknown().optional(),
+          annotations: z.unknown().optional(),
+          usage: z.array(z.string()).optional()
+        })).describe('All available tools with their schemas and usage guidance')
+      },
+      annotations: {
+        title: 'Status',
+        readOnlyHint: true,
+        idempotentHint: true,
+        openWorldHint: false
+      },
+      _meta: {
+        usage: [
+          'Call once at session start to learn the tool surface',
+          'Each tool entry includes its `usage` array of directives'
         ]
       }
     };
