@@ -12,6 +12,7 @@ import { z } from 'zod';
  * Top-level CCP configuration
  */
 export interface CcpConfig {
+  contextWindow: number;
   database: DatabaseConfig;
   geolocation: GeolocationConfig;
 }
@@ -63,9 +64,11 @@ export class Config {
     fallbackTimezone: z.string().default('UTC')
   });
   private static readonly ConfigSchema = z.object({
+    contextWindow: z.number().int().positive().default(1_000_000),
     database: Config.DatabaseSchema.optional(),
     geolocation: Config.GeolocationSchema.optional()
   }).transform(data => ({
+    contextWindow: data.contextWindow,
     database: data.database ?? Config.DatabaseSchema.parse({}),
     geolocation: data.geolocation ?? Config.GeolocationSchema.parse({})
   }));
@@ -105,6 +108,18 @@ export class Config {
       }
       throw error;
     }
+  }
+
+  /**
+   * Returns the configured context window size in tokens
+   *
+   * Used by `getContextUsage` for the percentage denominator. Defaults
+   * to 1,000,000; override in config for different window sizes.
+   *
+   * @returns {number} Context window size in tokens
+   */
+  get contextWindow(): number {
+    return this.settings.contextWindow;
   }
 
   /**

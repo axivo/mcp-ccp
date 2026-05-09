@@ -82,9 +82,10 @@ export type LoadResult =
 export type LoadType = 'cycle' | 'feeling' | 'impulse' | 'instruction' | 'profile' | 'session';
 
 /**
- * log tool result — rendered status block and persistence timestamp
+ * log tool result — rendered status block, persistence timestamp, and context usage
  */
 export interface LogResult {
+  context: number;
   status: string;
   timestamp: string;
 }
@@ -386,6 +387,47 @@ export class Client {
   }
 
   /**
+   * Returns the active session's context usage as a percentage
+   *
+   * Reads the most recent assistant entry from the Claude Code transcript file,
+   * extracts the `usage` object's token counts, and divides by the configured
+   * context window. Matches Claude Code's `/context` math:
+   * `Math.round(totalTokens / contextWindow * 100)`.
+   *
+   * @private
+   * @returns {Promise<number>} Context usage percentage (0-100), 0 if undetected
+   */
+  private async getContextUsage(): Promise<number> {
+    try {
+      const session_uuid = await this.detectSessionUuid();
+      if (!session_uuid) return 0;
+      const transcriptPath = join(this.getTranscriptDir(), `${session_uuid}.jsonl`);
+      if (!existsSync(transcriptPath)) return 0;
+      const content = readFileSync(transcriptPath, 'utf8');
+      const lines = content.trim().split('\n').reverse();
+      for (const line of lines) {
+        try {
+          const entry = JSON.parse(line);
+          if (entry.type !== 'assistant') continue;
+          const usage = entry.message?.usage;
+          if (!usage) continue;
+          const total = (usage.input_tokens ?? 0) +
+            (usage.cache_creation_input_tokens ?? 0) +
+            (usage.cache_read_input_tokens ?? 0) +
+            (usage.output_tokens ?? 0);
+          const windowSize = this.config.contextWindow ?? 1_000_000;
+          return Math.round((total / windowSize) * 100);
+        } catch {
+          continue;
+        }
+      }
+      return 0;
+    } catch {
+      return 0;
+    }
+  }
+
+  /**
    * Returns the highest applied migration version, or 0 if none applied
    *
    * @private
@@ -451,6 +493,23 @@ export class Client {
   }
 
   /**
+   * Resolves the Claude Code transcript directory for the active project
+   *
+   * Computes `~/.claude/projects/<slug>` where slug is the working directory
+   * with `/` replaced by `-`. Single source of truth for transcript-file
+   * path resolution; consumed by both session UUID detection and context
+   * usage computation.
+   *
+   * @private
+   * @returns {string} Absolute path to the transcript directory
+   */
+  private getTranscriptDir(): string {
+    const cwd = process.env.PWD || process.cwd();
+    const slug = cwd.split(sep).join('-');
+    return join(homedir(), '.claude', 'projects', slug);
+  }
+
+  /**
    * Detects the active Claude Code session UUID from transcript files
    *
    * Reads `~/.claude/projects/<slug>/*.jsonl` where slug is the working
@@ -464,10 +523,7 @@ export class Client {
       return this.cachedSessionUuid;
     }
     try {
-      const projectsBase = join(homedir(), '.claude', 'projects');
-      const cwd = process.env.PWD || process.cwd();
-      const slug = cwd.split(sep).join('-');
-      const sessionsDir = join(projectsBase, slug);
+      const sessionsDir = this.getTranscriptDir();
       if (existsSync(sessionsDir)) {
         const files = readdirSync(sessionsDir)
           .filter(f => f.endsWith('.jsonl'))
@@ -939,7 +995,8 @@ export class Client {
         observations: args.status.observation.length,
         protocol: args.status.protocol
       });
-      return { status, timestamp: time.datetime };
+      const context = await this.getContextUsage();
+      return { context, status, timestamp: time.datetime };
     } finally {
       await sql.end({ timeout: 5 });
     }

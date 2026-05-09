@@ -84,6 +84,7 @@ export class McpTool {
         }).describe('Status payload built during the response protocol')
       },
       outputSchema: {
+        context: z.number().describe('Active session context usage percentage computed from transcript'),
         status: z.string().describe('Two-line status block ready to render verbatim at end of response'),
         timestamp: z.string().describe('Server timestamp when row was persisted, ISO 8601 with timezone offset')
       },
