@@ -72,7 +72,7 @@ export class Mcp {
    * @param {object} args - Tool arguments
    * @returns {Promise<any>} Tool execution response
    */
-  private async handleLogResponse(args: { id: string; message: string; status: Record<string, unknown> }) {
+  private async handleLogResponse(args: { message: string; status: { cycle: string; feelings: number; impulses: number; observations: number; protocol: string } }) {
     try {
       const result = await this.client.logResponse(args);
       return this.structured(result as unknown as Record<string, unknown>);
@@ -109,7 +109,7 @@ export class Mcp {
    */
   private registerAll(): void {
     this.server.registerTool('load', this.tool.load(), (args) => this.handleLoad(args as { type: 'cycle' | 'feeling' | 'impulse' | 'instruction' | 'profile' | 'session'; parent?: string }));
-    this.server.registerTool('log_response', this.tool.logResponse(), (args) => this.handleLogResponse(args as { id: string; message: string; status: Record<string, unknown> }));
+    this.server.registerTool('log_response', this.tool.logResponse(), (args) => this.handleLogResponse(args as { message: string; status: { cycle: string; feelings: number; impulses: number; observations: number; protocol: string } }));
     this.server.registerTool('update', this.tool.update(), () => this.handleUpdate());
   }
 

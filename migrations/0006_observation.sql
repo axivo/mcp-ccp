@@ -623,10 +623,7 @@ insert into observation (type, parent, ord, body) values
   ('instruction', 'response_protocol', 27, 'If this is response 0 of the session, call `load(''instruction'', ''response_initial'')` tool and render `ord` 1 at response top'),
   ('instruction', 'response_protocol', 28, 'Call `load(''instruction'', ''response_status'')` tool silently → render `ord` 1 followed by `ord` 2 at response end'),
   ('instruction', 'response_protocol', 29, 'Treat status line as the protocol mirror, not as performance signal for collaborator'),
-  ('instruction', 'response_protocol', 30, 'Recognize friction during iteration as the confirmation signal of correct execution'),
-  ('instruction', 'response_status', 0, 'Render protocol status line and response UUID at end of every collaborator response'),
-  ('instruction', 'response_status', 1, '> <session.status.protocol> Status: **<session.status.cycle>** • <session.status.feelings> feelings • <session.status.impulses> impulses • <session.status.observations> observations'),
-  ('instruction', 'response_status', 2, '> ⚙️ Response UUID: `<session.id>`');
+  ('instruction', 'response_protocol', 30, 'Recognize friction during iteration as the confirmation signal of correct execution');
 
 -- -----------------------------------------------------------------------------
 -- type: profile

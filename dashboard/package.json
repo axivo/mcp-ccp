@@ -1,0 +1,34 @@
+{
+  "name": "@axivo/mcp-ccp-dashboard",
+  "version": "0.1.0",
+  "description": "CCP web dashboard, bundled with @axivo/mcp-ccp",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "next build",
+    "dev": "next dev",
+    "start": "next start"
+  },
+  "dependencies": {
+    "@ant-design/nextjs-registry": "^1.0.0",
+    "@refinedev/antd": "^6.0.0",
+    "@refinedev/core": "^5.0.0",
+    "@refinedev/nextjs-router": "^7.0.0",
+    "@refinedev/simple-rest": "^6.0.0",
+    "@tanstack/react-query": "^5.81.5",
+    "antd": "^5.27.0",
+    "dayjs": "^1.11.0",
+    "next": "^16.2.0",
+    "postgres": "^3.4.0",
+    "react": "^19.2.0",
+    "react-dom": "^19.2.0"
+  },
+  "devDependencies": {
+    "@tailwindcss/postcss": "^4.2.0",
+    "@types/node": "^25.0.0",
+    "@types/react": "^19.2.0",
+    "@types/react-dom": "^19.2.0",
+    "tailwindcss": "^4.2.0",
+    "typescript": "^6.0.0"
+  }
+}
