@@ -6,8 +6,9 @@
 .env.local
 
 # Logs
-logs/
 *.log
+*.txt
+logs/
 
 # MacOS
 **/.DS_Store
@@ -16,7 +17,15 @@ logs/
 Icon
 ._*
 
+# Next.js
+dashboard/.next/
+dashboard/.open-next/
+dashboard/next-env.d.ts
+dashboard/out/
+dashboard/*.tsbuildinfo
+
 # Node.js
+certs/
 dist/
 node_modules/
 
@@ -28,3 +37,8 @@ node_modules/
 
 # VS Code
 .history/
+
+# Wrangler
+dashboard/.dev.vars
+dashboard/.wrangler/
+dashboard/src/build/
