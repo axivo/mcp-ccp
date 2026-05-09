@@ -148,7 +148,7 @@ export class Mcp {
    * @param {object} args - Tool arguments
    * @returns {Promise<any>} Tool execution response
    */
-  private async handleSet(args: { key: 'session'; payload: { title?: string; description?: string } }) {
+  private async handleSet(args: { key: 'session'; payload?: { title?: string; description?: string } }) {
     try {
       const result = await this.client.set(args);
       return this.structured(result as unknown as Record<string, unknown>);
@@ -204,7 +204,7 @@ export class Mcp {
     this.server.registerTool('load', this.tool.load(), (args) => this.handleLoad(args as { type: 'cycle' | 'feeling' | 'impulse' | 'instruction' | 'profile' | 'session'; parent?: string }));
     this.server.registerTool('log', this.tool.log(), (args) => this.handleLog(args as { message: string; status: { cycle: string; feeling: string[]; impulse: string[]; observation: string[]; protocol: string } }));
     this.server.registerTool('render', this.tool.render(), (args) => this.handleRender(args as { key: 'profile'; value?: string }));
-    this.server.registerTool('set', this.tool.set(), (args) => this.handleSet(args as { key: 'session'; payload: { title?: string; description?: string } }));
+    this.server.registerTool('set', this.tool.set(), (args) => this.handleSet(args as { key: 'session'; payload?: { title?: string; description?: string } }));
     this.server.registerTool('status', this.tool.status(), () => this.handleStatus());
     this.server.registerTool('update', this.tool.update(), () => this.handleUpdate());
   }

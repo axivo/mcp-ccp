@@ -154,19 +154,28 @@ export class McpTool {
         payload: z.object({
           title: z.string().optional().describe('Conversation title for dashboard display'),
           description: z.string().optional().describe('Conversation description for dashboard display')
-        }).refine(
-          (p) => p.title !== undefined || p.description !== undefined,
-          { message: 'payload must include at least one of: title, description' }
-        ).describe('Fields to set; at least one required')
+        }).optional().describe('Fields to set; omit to ensure session row exists with server defaults')
       },
       outputSchema: {
         session: z.object({
-          session_uuid: z.string(),
+          profile: z.string().describe('Active framework profile from `CCP_PROFILE`'),
+          timestamp: z.object({
+            city: z.string(),
+            country: z.string(),
+            datetime: z.object({
+              current: z.string().describe('Current request timestamp, ISO 8601 with timezone offset'),
+              session: z.string().describe('Session start timestamp from session.created_at, ISO 8601 with timezone offset')
+            }),
+            day_of_week: z.string(),
+            is_dst: z.boolean(),
+            timezone: z.string()
+          }),
+          uuid: z.string().describe('Active session uuid'),
           title: z.string().nullable(),
           description: z.string().nullable(),
           created_at: z.string(),
           updated_at: z.string()
-        }).optional().describe('Resulting `session` row when key is `session`')
+        }).describe('Session envelope merged with the resulting `session` row state')
       },
       annotations: {
         title: 'Set',
@@ -176,9 +185,10 @@ export class McpTool {
       },
       _meta: {
         usage: [
-          'Call `set(session, payload)` to update conversation metadata for dashboard display',
-          'Pass `payload` with `title` and/or `description` fields to update',
-          'Server upserts on active session, populating `session_uuid` from the cached transcript detection',
+          'Call `set(session)` with no payload at session start to ensure the session row exists',
+          'Call `set(session, payload)` later to refine title or description as the conversation earns identity',
+          'Server fills `Collaboration Session` and a started-on description as defaults when payload is omitted',
+          'Server upserts on active session, populating uuid from the cached transcript detection',
           'Send only the fields you want to change; absent fields preserve existing values'
         ]
       }

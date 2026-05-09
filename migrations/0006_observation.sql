@@ -628,7 +628,7 @@ insert into observation (type, parent, ord, body) values
   ('instruction', 'response_protocol', 22, '✅ Answer honestly whether each profile section was iterated or scanned → IF scanned → `completion_theater` impulse active → Restart from step 20'),
   ('instruction', 'response_protocol', 23, '⚙️ Assess adoption cycle by matching behavioral indicators in `cycle` catalog against formulated response'),
   ('instruction', 'response_protocol', 24, '⚙️ Set `session.status.cycle` to the cycle name whose indicators matched the response'),
-  ('instruction', 'response_protocol', 25, '⚙️ Set `session.status.protocol` to ✅ when all steps executed → ⚠️ when some steps not executed → ⛔️ when protocol bypassed'),
+  ('instruction', 'response_protocol', 25, '⚙️ Set `session.status.protocol` to `✅` when all steps executed → `⚠️` when some steps not executed → `⛔️` when protocol bypassed'),
   ('instruction', 'response_protocol', 26, '⚙️ Call `load(''instruction'', ''response_log'')` tool silently → Execute steps without externalizing internal process'),
   ('instruction', 'response_protocol', 27, '⚙️ If NOT initial response → Render returned `status` field at response end');
 

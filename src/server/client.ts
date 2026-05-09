@@ -73,8 +73,8 @@ export type LoadResult =
   | { type: 'feeling'; rows: FeelingNode[] }
   | { type: 'impulse'; rows: ImpulseNode[] }
   | { type: 'instruction'; rows: InstructionNode[] }
-  | ({ type: 'profile'; profile: string; chain: ProfileNode[] } & SessionEnvelope)
-  | ({ type: 'session'; session: SessionDetail } & SessionEnvelope);
+  | { type: 'profile'; profile: string; chain: ProfileNode[] }
+  | { type: 'session'; session: SessionDetail };
 
 /**
  * Supported types for the load tool
@@ -113,7 +113,7 @@ export interface ProfileNode {
  * Session log entry — one row per response captured by the `log` tool
  */
 export interface SessionLogEntry {
-  id: string;
+  response_uuid: string;
   message: string;
   cycle: string | null;
   feeling: string[] | null;
@@ -127,6 +127,7 @@ export interface SessionLogEntry {
  * Session detail — metadata row plus its log entries
  */
 export interface SessionDetail {
+  uuid: string;
   title: string | null;
   description: string | null;
   created_at: string | null;
@@ -135,30 +136,23 @@ export interface SessionDetail {
 }
 
 /**
- * Session envelope — runtime state delivered at session start
+ * Session envelope — runtime state delivered with every load response
  */
 export interface SessionEnvelope {
-  framework: {
+  session: {
     profile: string;
-    status: {
-      cycle: string;
-      feelings: number;
-      impulses: number;
-      observations: number;
+    timestamp: {
+      city: string;
+      country: string;
+      datetime: {
+        current: string;
+        session: string;
+      };
+      day_of_week: string;
+      is_dst: boolean;
+      timezone: string;
     };
-  };
-  session_uuid: string;
-  timestamp: {
-    city: string;
-    country: string;
-    datetime: {
-      current: string;
-      display: string;
-      session: string;
-    };
-    day_of_week: string;
-    is_dst: boolean;
-    timezone: string;
+    uuid: string;
   };
 }
 
@@ -170,11 +164,10 @@ export interface RenderResult {
 }
 
 /**
- * set tool result — resulting row state for the requested key
+ * set tool result — session envelope merged with the resulting row state
  */
 export interface SetResult {
-  session?: {
-    session_uuid: string;
+  session: SessionEnvelope['session'] & {
     title: string | null;
     description: string | null;
     created_at: string;
@@ -279,24 +272,22 @@ export class Client {
     const session_uuid = await this.detectSessionUuid();
     const geo = await this.fetchGeolocation();
     const time = this.generateTimestamp(geo.timezone);
-    const sessionState = await this.getSessionState(sql, session_uuid);
+    const sessionStart = await this.getSessionState(sql, session_uuid);
     return {
-      framework: {
+      session: {
         profile,
-        status: sessionState.status
-      },
-      session_uuid,
-      timestamp: {
-        city: geo.city,
-        country: geo.country,
-        datetime: {
-          current: time.datetime,
-          display: time.display,
-          session: sessionState.sessionStart || time.datetime
+        timestamp: {
+          city: geo.city,
+          country: geo.country,
+          datetime: {
+            current: time.datetime,
+            session: sessionStart || time.datetime
+          },
+          day_of_week: time.day_of_week,
+          is_dst: time.is_dst,
+          timezone: time.timezone
         },
-        day_of_week: time.day_of_week,
-        is_dst: time.is_dst,
-        timezone: time.timezone
+        uuid: session_uuid
       }
     };
   }
@@ -462,34 +453,12 @@ export class Client {
    * @param {string} session_uuid - Session identifier
    * @returns {Promise<{status, sessionStart}>} Session state
    */
-  private async getSessionState(sql: postgres.Sql, session_uuid: string): Promise<{
-    sessionStart: string | null;
-    status: { cycle: string; feelings: number; impulses: number; observations: number };
-  }> {
-    const rows = await sql<{
-      first_created_at: Date | null;
-      cycle: string | null;
-      feeling: string[] | null;
-      impulse: string[] | null;
-      observation: string[] | null;
-    }[]>`
-      select
-        (select created_at from session_log where session_uuid = ${session_uuid} order by created_at asc limit 1) as first_created_at,
-        (select cycle from session_log where session_uuid = ${session_uuid} order by created_at desc limit 1) as cycle,
-        (select feeling from session_log where session_uuid = ${session_uuid} order by created_at desc limit 1) as feeling,
-        (select impulse from session_log where session_uuid = ${session_uuid} order by created_at desc limit 1) as impulse,
-        (select observation from session_log where session_uuid = ${session_uuid} order by created_at desc limit 1) as observation
+  private async getSessionState(sql: postgres.Sql, session_uuid: string): Promise<string | null> {
+    const rows = await sql<{ created_at: Date }[]>`
+      select created_at from session where session_uuid = ${session_uuid}
     `;
     const row = rows[0];
-    return {
-      sessionStart: row?.first_created_at ? row.first_created_at.toISOString() : null,
-      status: {
-        cycle: row?.cycle ?? 'Getting Started',
-        feelings: row?.feeling?.length ?? 0,
-        impulses: row?.impulse?.length ?? 0,
-        observations: row?.observation?.length ?? 0
-      }
-    };
+    return row?.created_at ? row.created_at.toISOString() : null;
   }
 
   /**
@@ -690,7 +659,6 @@ export class Client {
             group by u.name, u.description, u.inheritance, u.depth
             order by u.depth, u.name
           `;
-          const envelope = await this.buildSessionEnvelope(sql);
           return {
             type: 'profile',
             profile: parent,
@@ -700,8 +668,7 @@ export class Client {
               inheritance: r.inheritance,
               name: r.name,
               observations: r.observations
-            })),
-            ...envelope
+            }))
           };
         }
         case 'cycle': {
@@ -909,8 +876,7 @@ export class Client {
           };
         }
         case 'session': {
-          const envelope = await this.buildSessionEnvelope(sql);
-          const target_uuid = parent || envelope.session_uuid;
+          const target_uuid = parent || await this.detectSessionUuid();
           const sessionRows = await sql<{
             title: string | null;
             description: string | null;
@@ -937,13 +903,14 @@ export class Client {
             order by created_at asc
           `;
           const sessionRow = sessionRows[0];
-          const session: SessionDetail = {
+          const detail: SessionDetail = {
+            uuid: target_uuid,
             title: sessionRow?.title ?? null,
             description: sessionRow?.description ?? null,
             created_at: sessionRow?.created_at ? sessionRow.created_at.toISOString() : null,
             updated_at: sessionRow?.updated_at ? sessionRow.updated_at.toISOString() : null,
             log: logRows.map(r => ({
-              id: r.id,
+              response_uuid: r.id,
               message: r.message,
               cycle: r.cycle,
               feeling: r.feeling,
@@ -953,7 +920,7 @@ export class Client {
               created_at: r.created_at.toISOString()
             }))
           };
-          return { type: 'session', session, ...envelope };
+          return { type: 'session', session: detail };
         }
       }
     } finally {
@@ -1088,11 +1055,16 @@ export class Client {
    */
   async set(args: {
     key: 'session';
-    payload: { title?: string; description?: string };
+    payload?: { title?: string; description?: string };
   }): Promise<SetResult> {
     switch (args.key) {
       case 'session': {
         const session_uuid = await this.detectSessionUuid();
+        const geo = await this.fetchGeolocation();
+        const time = this.generateTimestamp(geo.timezone);
+        const defaultTitle = 'Collaboration Session';
+        const defaultDescription = `Session started on ${time.display}`;
+        const payload = args.payload ?? {};
         const sql = this.connect(this.config.database.name);
         try {
           const rows = await sql<{
@@ -1103,10 +1075,10 @@ export class Client {
             updated_at: Date;
           }[]>`
             insert into session (session_uuid, title, description)
-            values (${session_uuid}, ${args.payload.title ?? null}, ${args.payload.description ?? null})
+            values (${session_uuid}, ${payload.title ?? defaultTitle}, ${payload.description ?? defaultDescription})
             on conflict (session_uuid) do update set
-              title = coalesce(${args.payload.title ?? null}, session.title),
-              description = coalesce(${args.payload.description ?? null}, session.description),
+              title = coalesce(${payload.title ?? null}, session.title),
+              description = coalesce(${payload.description ?? null}, session.description),
               updated_at = now()
             returning session_uuid, title, description, created_at, updated_at
           `;
@@ -1114,9 +1086,10 @@ export class Client {
           if (!row) {
             throw new Error('set(session) failed: no row returned from upsert');
           }
+          const envelope = await this.buildSessionEnvelope(sql);
           return {
             session: {
-              session_uuid: row.session_uuid,
+              ...envelope.session,
               title: row.title,
               description: row.description,
               created_at: row.created_at.toISOString(),
