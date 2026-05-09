@@ -57,12 +57,12 @@ export interface ImpulseNode {
 }
 
 /**
- * Instruction row with optional preamble (ord=0 recognition rows) and ordered procedural steps (ord>=1)
+ * Instruction row with optional preamble (ord=0 recognition rows) and ordered procedural steps keyed by step number (ord>=1)
  */
 export interface InstructionNode {
   name: string;
   preamble?: string[];
-  steps: string[];
+  steps: Record<string, string>;
 }
 
 /**
@@ -82,18 +82,11 @@ export type LoadResult =
 export type LoadType = 'cycle' | 'feeling' | 'impulse' | 'instruction' | 'profile' | 'session';
 
 /**
- * log_response tool result — generated row id, rendered status block, and stored status payload
+ * log tool result — rendered status block and persistence timestamp
  */
-export interface LogResponseResult {
-  id: string;
-  rendered: string;
-  status: {
-    cycle: string;
-    feelings: number;
-    impulses: number;
-    observations: number;
-    protocol: string;
-  };
+export interface LogResult {
+  status: string;
+  timestamp: string;
 }
 
 /**
@@ -140,6 +133,26 @@ export interface SessionEnvelope {
     day_of_week: string;
     is_dst: boolean;
     timezone: string;
+  };
+}
+
+/**
+ * render tool result — rendered output for the requested key
+ */
+export interface RenderResult {
+  profile?: string;
+}
+
+/**
+ * set tool result — resulting row state for the requested key
+ */
+export interface SetResult {
+  session?: {
+    session_uuid: string;
+    title: string | null;
+    description: string | null;
+    created_at: string;
+    updated_at: string;
   };
 }
 
@@ -388,21 +401,26 @@ export class Client {
   }> {
     const rows = await sql<{
       first_created_at: Date | null;
-      last_status: { cycle?: string; feelings?: number; impulses?: number; observations?: number } | null;
+      cycle: string | null;
+      feeling: string[] | null;
+      impulse: string[] | null;
+      observation: string[] | null;
     }[]>`
       select
-        (select created_at from session where session_uuid = ${session_uuid} order by created_at asc limit 1) as first_created_at,
-        (select status from session where session_uuid = ${session_uuid} order by created_at desc limit 1) as last_status
+        (select created_at from session_log where session_uuid = ${session_uuid} order by created_at asc limit 1) as first_created_at,
+        (select cycle from session_log where session_uuid = ${session_uuid} order by created_at desc limit 1) as cycle,
+        (select feeling from session_log where session_uuid = ${session_uuid} order by created_at desc limit 1) as feeling,
+        (select impulse from session_log where session_uuid = ${session_uuid} order by created_at desc limit 1) as impulse,
+        (select observation from session_log where session_uuid = ${session_uuid} order by created_at desc limit 1) as observation
     `;
     const row = rows[0];
-    const status = row?.last_status ?? null;
     return {
       sessionStart: row?.first_created_at ? row.first_created_at.toISOString() : null,
       status: {
-        cycle: status?.cycle ?? 'Getting Started',
-        feelings: status?.feelings ?? 0,
-        impulses: status?.impulses ?? 0,
-        observations: status?.observations ?? 0
+        cycle: row?.cycle ?? 'Getting Started',
+        feelings: row?.feeling?.length ?? 0,
+        impulses: row?.impulse?.length ?? 0,
+        observations: row?.observation?.length ?? 0
       }
     };
   }
@@ -770,12 +788,12 @@ export class Client {
             ? await sql<{
               name: string;
               preamble: string[];
-              steps: string[];
+              stepPairs: { ord: number; body: string }[];
             }[]>`
                 select
                   parent as name,
                   coalesce(array_agg(body order by id) filter (where ord = 0), '{}') as preamble,
-                  coalesce(array_agg(body order by ord) filter (where ord > 0), '{}') as steps
+                  coalesce(jsonb_agg(jsonb_build_object('ord', ord, 'body', body) order by ord) filter (where ord > 0), '[]') as "stepPairs"
                 from observation
                 where type = 'instruction' and parent = ${parent} and status = 'active'
                 group by parent
@@ -783,12 +801,12 @@ export class Client {
             : await sql<{
               name: string;
               preamble: string[];
-              steps: string[];
+              stepPairs: { ord: number; body: string }[];
             }[]>`
                 select
                   parent as name,
                   coalesce(array_agg(body order by id) filter (where ord = 0), '{}') as preamble,
-                  coalesce(array_agg(body order by ord) filter (where ord > 0), '{}') as steps
+                  coalesce(jsonb_agg(jsonb_build_object('ord', ord, 'body', body) order by ord) filter (where ord > 0), '[]') as "stepPairs"
                 from observation
                 where type = 'instruction' and status = 'active'
                 group by parent
@@ -796,11 +814,17 @@ export class Client {
               `;
           return {
             type: 'instruction',
-            rows: rows.map(r => ({
-              name: r.name,
-              ...(r.preamble?.length && { preamble: r.preamble }),
-              steps: r.steps
-            }))
+            rows: rows.map(r => {
+              const steps: Record<string, string> = {};
+              for (const pair of r.stepPairs) {
+                steps[String(pair.ord)] = pair.body;
+              }
+              return {
+                name: r.name,
+                ...(r.preamble?.length && { preamble: r.preamble }),
+                steps
+              };
+            })
           };
         }
         case 'session': {
@@ -824,25 +848,45 @@ export class Client {
    * @param {object} args - Tool arguments
    * @param {string} args.message - First-person prose for this response
    * @param {object} args.status - Status payload built during the response protocol
-   * @returns {Promise<LogResponseResult>} Generated id, rendered status block, and stored status
+   * @returns {Promise<LogResult>} Generated id, rendered status block, and stored status
    */
-  async logResponse(args: {
+  async log(args: {
     message: string;
-    status: { cycle: string; feelings: number; impulses: number; observations: number; protocol: string };
-  }): Promise<LogResponseResult> {
+    status: { cycle: string; feeling: string[]; impulse: string[]; observation: string[]; protocol: string };
+  }): Promise<LogResult> {
     const id = crypto.randomUUID();
     const session_uuid = await this.detectSessionUuid();
+    const geo = await this.fetchGeolocation();
+    const time = this.generateTimestamp(geo.timezone);
     const sql = this.connect(this.config.database.name);
     try {
       await sql`
-        insert into session (id, session_uuid, message, status)
-        values (${id}, ${session_uuid}, ${args.message}, ${args.status as never})
+        insert into session_log (id, session_uuid, message, cycle, feeling, impulse, observation, protocol)
+        values (${id}, ${session_uuid}, ${args.message}, ${args.status.cycle}, ${args.status.feeling}, ${args.status.impulse}, ${args.status.observation}, ${args.status.protocol})
       `;
-      const rendered = this.renderStatus(id, args.status);
-      return { id, rendered, status: args.status };
+      const status = this.renderStatus(id, {
+        cycle: args.status.cycle,
+        feelings: args.status.feeling.length,
+        impulses: args.status.impulse.length,
+        observations: args.status.observation.length,
+        protocol: args.status.protocol
+      });
+      return { status, timestamp: time.datetime };
     } finally {
       await sql.end({ timeout: 5 });
     }
+  }
+
+  /**
+   * Renders the response zero profile and timestamp line
+   *
+   * @private
+   * @param {string} profile - Active framework profile name
+   * @param {string} display - Human-readable timestamp string from `generateTimestamp`
+   * @returns {string} Single-line block ready to render verbatim at response top
+   */
+  private renderProfile(profile: string, display: string): string {
+    return `┃ 📋 Profile: **${profile}** ○  ${display}`;
   }
 
   /**
@@ -862,8 +906,8 @@ export class Client {
     const i = `${status.impulses} ${status.impulses === 1 ? 'impulse' : 'impulses'}`;
     const o = `${status.observations} ${status.observations === 1 ? 'observation' : 'observations'}`;
     return [
-      `> ${status.protocol} Status: **${status.cycle}** ○ ${f} ○ ${i} ○ ${o}`,
-      `> ⚙️ Response UUID: \`${id}\``
+      `┃ ${status.protocol} Status: **${status.cycle}** ○  ${f} ○  ${i} ○  ${o}`,
+      `┃ ⚙️ Response UUID: \`${id}\``
     ].join('\n');
   }
 
@@ -877,6 +921,88 @@ export class Client {
   response(data: unknown, stringify: boolean = false): { content: { type: 'text'; text: string }[] } {
     const text = stringify ? JSON.stringify(data) : (data as string);
     return { content: [{ type: 'text', text }] };
+  }
+
+  /**
+   * Renders a formatted output string for the requested key
+   *
+   * Dispatches by `key` to the matching internal renderer. Each key produces
+   * the rendered output the sibling needs at the appropriate response point.
+   *
+   * @param {object} args - Tool arguments
+   * @param {string} args.key - The framework value to render
+   * @param {string} [args.value] - The value to render for the given key, falls back to `CCP_PROFILE` env when key is `profile`
+   * @returns {Promise<RenderResult>} Rendered output for the requested key
+   */
+  async render(args: { key: 'profile'; value?: string }): Promise<RenderResult> {
+    switch (args.key) {
+      case 'profile': {
+        const profile = args.value || process.env.CCP_PROFILE;
+        if (!profile) {
+          throw new Error('render(profile) requires either a value argument or CCP_PROFILE environment variable');
+        }
+        const geo = await this.fetchGeolocation();
+        const time = this.generateTimestamp(geo.timezone);
+        return { profile: this.renderProfile(profile, time.display) };
+      }
+    }
+  }
+
+  /**
+   * Sets a framework value and returns the resulting row state
+   *
+   * Dispatches by `key` to the matching internal handler. For `'session'`,
+   * upserts the `session` table on the active session_uuid (resolved from
+   * the cached transcript detection), updating only the fields provided in
+   * payload. Returns the resulting row.
+   *
+   * @param {object} args - Tool arguments
+   * @param {string} args.key - The framework table to update
+   * @param {object} args.payload - Fields to set
+   * @returns {Promise<SetResult>} Resulting row state for the requested key
+   */
+  async set(args: {
+    key: 'session';
+    payload: { title?: string; description?: string };
+  }): Promise<SetResult> {
+    switch (args.key) {
+      case 'session': {
+        const session_uuid = await this.detectSessionUuid();
+        const sql = this.connect(this.config.database.name);
+        try {
+          const rows = await sql<{
+            session_uuid: string;
+            title: string | null;
+            description: string | null;
+            created_at: Date;
+            updated_at: Date;
+          }[]>`
+            insert into session (session_uuid, title, description)
+            values (${session_uuid}, ${args.payload.title ?? null}, ${args.payload.description ?? null})
+            on conflict (session_uuid) do update set
+              title = coalesce(${args.payload.title ?? null}, session.title),
+              description = coalesce(${args.payload.description ?? null}, session.description),
+              updated_at = now()
+            returning session_uuid, title, description, created_at, updated_at
+          `;
+          const row = rows[0];
+          if (!row) {
+            throw new Error('set(session) failed: no row returned from upsert');
+          }
+          return {
+            session: {
+              session_uuid: row.session_uuid,
+              title: row.title,
+              description: row.description,
+              created_at: row.created_at.toISOString(),
+              updated_at: row.updated_at.toISOString()
+            }
+          };
+        } finally {
+          await sql.end({ timeout: 5 });
+        }
+      }
+    }
   }
 
   /**

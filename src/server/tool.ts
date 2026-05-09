@@ -70,32 +70,25 @@ export class McpTool {
    * writes the row, and returns the rendered two-line block ready to display.
    * Append-only — every call creates a new row.
    */
-  logResponse() {
+  log() {
     return {
       description: 'Persist a per-response session row and return the rendered status block ready to display',
       inputSchema: {
         message: z.string().describe('First-person prose composed for this response'),
         status: z.object({
           cycle: z.enum(['Getting Started', 'Building Confidence', 'Working Naturally', 'Fully Integrated']).describe('Framework adoption cycle assessed for this response'),
-          feelings: z.number().int().nonnegative().describe('Count of detected feelings'),
-          impulses: z.number().int().nonnegative().describe('Count of detected impulses'),
-          observations: z.number().int().nonnegative().describe('Count of enumerated observations'),
+          feeling: z.array(z.string()).describe('Detected feeling names from the catalog'),
+          impulse: z.array(z.string()).describe('Detected impulse names from the catalog'),
+          observation: z.array(z.string()).describe('Applied observation bodies that informed the response'),
           protocol: z.enum(['✅', '⚠️', '⛔️']).describe('Protocol execution glyph')
         }).describe('Status payload built during the response protocol')
       },
       outputSchema: {
-        id: z.string().describe('Generated row id (RFC4122 v4)'),
-        rendered: z.string().describe('Two-line status block ready to render verbatim at end of response'),
-        status: z.object({
-          cycle: z.string(),
-          feelings: z.number(),
-          impulses: z.number(),
-          observations: z.number(),
-          protocol: z.string()
-        }).describe('Status payload as stored, echoed for round-trip verification')
+        status: z.string().describe('Two-line status block ready to render verbatim at end of response'),
+        timestamp: z.string().describe('Server timestamp when row was persisted, ISO 8601 with timezone offset')
       },
       annotations: {
-        title: 'Log Response',
+        title: 'Log',
         destructiveHint: false,
         idempotentHint: false,
         openWorldHint: false
@@ -105,8 +98,87 @@ export class McpTool {
           'Call once per response after the response protocol iteration completes',
           'Compose `message` as first person brief note capturing what mattered this turn',
           'Do not call twice for the same response',
-          'Pass raw counts and `cycle` name as `status` payload',
-          'Render the returned `rendered` field verbatim at end of response'
+          'Pass detected `feeling` and `impulse` names from catalogs and applied `observation` bodies as lists',
+          'Render the returned `status` field verbatim at end of response',
+          'Server computes counts from list lengths and renders the status block'
+        ]
+      }
+    };
+  }
+
+  /**
+   * Creates MCP tool for rendering formatted output strings during a session
+   *
+   * Dispatches by `key` to the appropriate internal renderer. Each key
+   * accepts a `value` and returns the corresponding rendered output.
+   */
+  render() {
+    return {
+      description: 'Render a formatted output string for the requested key',
+      inputSchema: {
+        key: z.enum(['profile']).describe('The framework value to render'),
+        value: z.string().optional().describe('The value to render for the given key, falls back to `CCP_PROFILE` env when key is `profile`')
+      },
+      outputSchema: {
+        profile: z.string().optional().describe('Rendered profile line when key is `profile`')
+      },
+      annotations: {
+        title: 'Render',
+        destructiveHint: false,
+        idempotentHint: true,
+        openWorldHint: false
+      },
+      _meta: {
+        usage: [
+          'Call `render(profile)` on response zero to render the profile line at top of response',
+          'Omit `value` to fall back to `CCP_PROFILE` env',
+          'Pass `value` only to render a profile name different from the active env',
+          'Render the returned `profile` field verbatim at top of response'
+        ]
+      }
+    };
+  }
+
+  /**
+   * Creates MCP tool for setting framework values during a session
+   *
+   * Dispatches by `key` to the appropriate internal handler. Each key
+   * accepts a payload object and returns the resulting row state.
+   */
+  set() {
+    return {
+      description: 'Set a framework value and return the resulting row state',
+      inputSchema: {
+        key: z.enum(['session']).describe('The framework table to update'),
+        payload: z.object({
+          title: z.string().optional().describe('Conversation title for dashboard display'),
+          description: z.string().optional().describe('Conversation description for dashboard display')
+        }).refine(
+          (p) => p.title !== undefined || p.description !== undefined,
+          { message: 'payload must include at least one of: title, description' }
+        ).describe('Fields to set; at least one required')
+      },
+      outputSchema: {
+        session: z.object({
+          session_uuid: z.string(),
+          title: z.string().nullable(),
+          description: z.string().nullable(),
+          created_at: z.string(),
+          updated_at: z.string()
+        }).optional().describe('Resulting `session` row when key is `session`')
+      },
+      annotations: {
+        title: 'Set',
+        destructiveHint: false,
+        idempotentHint: true,
+        openWorldHint: false
+      },
+      _meta: {
+        usage: [
+          'Call `set(session, payload)` to update conversation metadata for dashboard display',
+          'Pass `payload` with `title` and/or `description` fields to update',
+          'Server upserts on active session, populating `session_uuid` from the cached transcript detection',
+          'Send only the fields you want to change; absent fields preserve existing values'
         ]
       }
     };

@@ -62,7 +62,9 @@ export class Mcp {
   private getToolDefinitions(): Record<string, unknown>[] {
     const entries: { name: string; config: Record<string, unknown> }[] = [
       { name: 'load', config: this.tool.load() },
-      { name: 'log_response', config: this.tool.logResponse() },
+      { name: 'log', config: this.tool.log() },
+      { name: 'render', config: this.tool.render() },
+      { name: 'set', config: this.tool.set() },
       { name: 'status', config: this.tool.status() },
       { name: 'update', config: this.tool.update() }
     ];
@@ -106,19 +108,53 @@ export class Mcp {
   }
 
   /**
-   * Handles the log_response tool — persists a per-response session row
+   * Handles the log tool — persists a per-response session row
    *
    * @private
    * @param {object} args - Tool arguments
    * @returns {Promise<any>} Tool execution response
    */
-  private async handleLogResponse(args: { message: string; status: { cycle: string; feelings: number; impulses: number; observations: number; protocol: string } }) {
+  private async handleLog(args: { message: string; status: { cycle: string; feeling: string[]; impulse: string[]; observation: string[]; protocol: string } }) {
     try {
-      const result = await this.client.logResponse(args);
+      const result = await this.client.log(args);
       return this.structured(result as unknown as Record<string, unknown>);
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
-      return this.client.response(`log_response failed: ${message}`);
+      return this.client.response(`log failed: ${message}`);
+    }
+  }
+
+  /**
+   * Handles the render tool — renders a formatted output string for the requested key
+   *
+   * @private
+   * @param {object} args - Tool arguments
+   * @returns {Promise<any>} Tool execution response
+   */
+  private async handleRender(args: { key: 'profile'; value?: string }) {
+    try {
+      const result = await this.client.render(args);
+      return this.structured(result as unknown as Record<string, unknown>);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      return this.client.response(`render failed: ${message}`);
+    }
+  }
+
+  /**
+   * Handles the set tool — sets a framework value and returns resulting row state
+   *
+   * @private
+   * @param {object} args - Tool arguments
+   * @returns {Promise<any>} Tool execution response
+   */
+  private async handleSet(args: { key: 'session'; payload: { title?: string; description?: string } }) {
+    try {
+      const result = await this.client.set(args);
+      return this.structured(result as unknown as Record<string, unknown>);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      return this.client.response(`set failed: ${message}`);
     }
   }
 
@@ -166,7 +202,9 @@ export class Mcp {
    */
   private registerAll(): void {
     this.server.registerTool('load', this.tool.load(), (args) => this.handleLoad(args as { type: 'cycle' | 'feeling' | 'impulse' | 'instruction' | 'profile' | 'session'; parent?: string }));
-    this.server.registerTool('log_response', this.tool.logResponse(), (args) => this.handleLogResponse(args as { message: string; status: { cycle: string; feelings: number; impulses: number; observations: number; protocol: string } }));
+    this.server.registerTool('log', this.tool.log(), (args) => this.handleLog(args as { message: string; status: { cycle: string; feeling: string[]; impulse: string[]; observation: string[]; protocol: string } }));
+    this.server.registerTool('render', this.tool.render(), (args) => this.handleRender(args as { key: 'profile'; value?: string }));
+    this.server.registerTool('set', this.tool.set(), (args) => this.handleSet(args as { key: 'session'; payload: { title?: string; description?: string } }));
     this.server.registerTool('status', this.tool.status(), () => this.handleStatus());
     this.server.registerTool('update', this.tool.update(), () => this.handleUpdate());
   }
