@@ -179,6 +179,7 @@ export interface SetResult {
  * status tool result — database snapshot at session start
  */
 export interface StatusResult {
+  context: number;
   schemaVersion: number;
   statistics: {
     cycles: number;
@@ -937,12 +938,13 @@ export class Client {
    * response. Append-only — every call creates a new row.
    *
    * @param {object} args - Tool arguments
-   * @param {string} args.message - First-person prose for this response
-   * @param {object} args.status - Status payload built during the response protocol
+   * @param {object} args.payload - Sibling-authored content for this entry
+   * @param {string} args.payload.message - First-person prose for this response
+   * @param {object} args.status - Protocol execution record built during the response protocol
    * @returns {Promise<LogResult>} Generated id, rendered status block, and stored status
    */
   async log(args: {
-    message: string;
+    payload: { message: string };
     status: { cycle: string; feeling: string[]; impulse: string[]; observation: string[]; protocol: string };
   }): Promise<LogResult> {
     const id = crypto.randomUUID();
@@ -953,7 +955,7 @@ export class Client {
     try {
       await sql`
         insert into session_log (id, session_uuid, message, cycle, feeling, impulse, observation, protocol)
-        values (${id}, ${session_uuid}, ${args.message}, ${args.status.cycle}, ${args.status.feeling}, ${args.status.impulse}, ${args.status.observation}, ${args.status.protocol})
+        values (${id}, ${session_uuid}, ${args.payload.message}, ${args.status.cycle}, ${args.status.feeling}, ${args.status.impulse}, ${args.status.observation}, ${args.status.protocol})
       `;
       const status = this.renderStatus(id, {
         cycle: args.status.cycle,
@@ -1122,7 +1124,9 @@ export class Client {
       const [{ count: instructions }] = await sql<{ count: number }[]>`select count(distinct parent)::int as count from observation where type = 'instruction'`;
       const [{ count: observations }] = await sql<{ count: number }[]>`select count(*)::int as count from observation`;
       const [{ count: profiles }] = await sql<{ count: number }[]>`select count(*)::int as count from profile`;
+      const context = await this.getContextUsage();
       return {
+        context,
         schemaVersion,
         statistics: { cycles, feelings, impulses, instructions, observations, profiles }
       };

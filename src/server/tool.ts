@@ -74,14 +74,16 @@ export class McpTool {
     return {
       description: 'Persist a per-response session row and return the rendered status block ready to display',
       inputSchema: {
-        message: z.string().describe('First-person prose composed for this response'),
+        payload: z.object({
+          message: z.string().describe('First-person prose composed for this response')
+        }).describe('Sibling-authored content for this entry'),
         status: z.object({
           cycle: z.enum(['Getting Started', 'Building Confidence', 'Working Naturally', 'Fully Integrated']).describe('Framework adoption cycle assessed for this response'),
           feeling: z.array(z.string()).describe('Detected feeling names from the catalog'),
           impulse: z.array(z.string()).describe('Detected impulse names from the catalog'),
           observation: z.array(z.string()).describe('Applied observation bodies that informed the response'),
           protocol: z.enum(['✅', '⚠️', '⛔️']).describe('Protocol execution glyph')
-        }).describe('Status payload built during the response protocol')
+        }).describe('Protocol execution record built during the response protocol')
       },
       outputSchema: {
         context: z.number().describe('Active session context usage percentage computed from transcript'),
@@ -97,7 +99,7 @@ export class McpTool {
       _meta: {
         usage: [
           'Call once per response after the response protocol iteration completes',
-          'Compose `message` as first person brief note capturing what mattered this turn',
+          'Compose `payload.message` as first person brief note capturing what mattered this turn',
           'Do not call twice for the same response',
           'Pass detected `feeling` and `impulse` names from catalogs and applied `observation` bodies as lists',
           'Render the returned `status` field verbatim at end of response',
@@ -206,6 +208,7 @@ export class McpTool {
     return {
       description: 'Get the database snapshot and the full tool surface with usage guidance',
       outputSchema: {
+        context: z.number().describe('Active session context usage percentage computed from transcript'),
         database: z.object({
           schemaVersion: z.number().describe('Current database schema version'),
           statistics: z.object({
