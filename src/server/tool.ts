@@ -37,7 +37,10 @@ export class McpTool {
       description: 'Load framework data of the given type (cycle, feeling, impulse, or profile)',
       inputSchema: {
         type: z.enum(['cycle', 'feeling', 'impulse', 'instruction', 'profile', 'session']).describe('The framework data type to load'),
-        parent: z.string().optional().describe('Parent name, required when type is profile (e.g., DEVELOPER)')
+        parent: z.string().optional().describe('Parent name, required when type is profile (e.g., DEVELOPER)'),
+        limit: z.number().int().positive().max(100).default(10).describe('Maximum log entries to return when type is `session` (max 100)'),
+        offset: z.number().int().min(0).default(0).describe('Skip this many entries when type is `session`'),
+        uuid: z.string().optional().describe('Target session uuid when type is `session` (defaults to active session)')
       },
       annotations: {
         title: 'Load',
@@ -51,6 +54,12 @@ export class McpTool {
           'Pass `cycle` `feeling` `impulse` or `instruction` to fetch full catalog',
           'Pass `parent` with any catalog `type` to fetch a single row',
           'Pass `profile` with `parent` to fetch inheritance chain and observations',
+          'Pass `session` to fetch the most recent log entries of the active session',
+          'Pass `session` with `limit` to widen or narrow the slice',
+          'Pass `session` with `offset` to page back through older entries',
+          'Pass `session` with `uuid` to read a different session (defaults to active session)',
+          'Session response includes `payload.messages` total count, useful for assessing session size',
+          'Session log entries are ordered most-recent-first',
           'Use `cycle` for adoption assessment indicators',
           'Use `feeling` for recall during response protocol',
           'Use `impulse` for systematic iteration during response protocol',
@@ -86,8 +95,14 @@ export class McpTool {
         }).describe('Protocol execution record built during the response protocol')
       },
       outputSchema: {
-        context: z.number().describe('Active session context usage percentage computed from transcript'),
-        status: z.string().describe('Two-line status block ready to render verbatim at end of response'),
+        payload: z.object({
+          context: z.number().describe('Active session context usage percentage computed from transcript'),
+          status: z.string().describe('Two-line status block ready to render verbatim at end of response'),
+          tokens: z.object({
+            total: z.number().describe('Configured context window size in tokens'),
+            used: z.number().describe('Tokens used in the active session')
+          }).describe('Absolute token counts for the active session')
+        }).describe('Sibling-facing content for this response'),
         timestamp: z.string().describe('Server timestamp when row was persisted, ISO 8601 with timezone offset')
       },
       annotations: {
@@ -164,12 +179,9 @@ export class McpTool {
           timestamp: z.object({
             city: z.string(),
             country: z.string(),
-            datetime: z.object({
-              current: z.string().describe('Current request timestamp, ISO 8601 with timezone offset'),
-              session: z.string().describe('Session start timestamp from session.created_at, ISO 8601 with timezone offset')
-            }),
-            day_of_week: z.string(),
+            current: z.string().describe('Latest log activity timestamp, ISO 8601 with active timezone offset'),
             is_dst: z.boolean(),
+            session: z.string().describe('Session start timestamp from session.created_at, ISO 8601 with active timezone offset'),
             timezone: z.string()
           }),
           uuid: z.string().describe('Active session uuid'),
@@ -208,7 +220,6 @@ export class McpTool {
     return {
       description: 'Get the database snapshot and the full tool surface with usage guidance',
       outputSchema: {
-        context: z.number().describe('Active session context usage percentage computed from transcript'),
         database: z.object({
           schemaVersion: z.number().describe('Current database schema version'),
           statistics: z.object({
@@ -220,6 +231,13 @@ export class McpTool {
             profiles: z.number().describe('Distinct profiles in catalog')
           }).describe('Distinct-name counts across each catalog table')
         }).describe('Database snapshot at session start'),
+        payload: z.object({
+          context: z.number().describe('Active session context usage percentage computed from transcript'),
+          tokens: z.object({
+            total: z.number().describe('Configured context window size in tokens'),
+            used: z.number().describe('Tokens used in the active session')
+          }).describe('Absolute token counts for the active session')
+        }).describe('Sibling-facing session state'),
         tools: z.array(z.object({
           name: z.string(),
           description: z.string(),

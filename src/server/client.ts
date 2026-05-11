@@ -11,6 +11,7 @@ import { homedir } from 'os';
 import { dirname, join, sep } from 'path';
 import postgres from 'postgres';
 import { fileURLToPath } from 'url';
+import { Time } from '../lib/time.js';
 import { Config } from './config.js';
 
 /**
@@ -82,11 +83,17 @@ export type LoadResult =
 export type LoadType = 'cycle' | 'feeling' | 'impulse' | 'instruction' | 'profile' | 'session';
 
 /**
- * log tool result — rendered status block, persistence timestamp, and context usage
+ * log tool result — sibling-facing payload plus persistence timestamp
  */
 export interface LogResult {
-  context: number;
-  status: string;
+  payload: {
+    context: number;
+    status: string;
+    tokens: {
+      total: number;
+      used: number;
+    };
+  };
   timestamp: string;
 }
 
@@ -124,7 +131,7 @@ export interface SessionLogEntry {
 }
 
 /**
- * Session detail — metadata row plus its log entries
+ * Session detail — metadata row plus payload envelope with log slice and total
  */
 export interface SessionDetail {
   uuid: string;
@@ -132,7 +139,10 @@ export interface SessionDetail {
   description: string | null;
   created_at: string | null;
   updated_at: string | null;
-  log: SessionLogEntry[];
+  payload: {
+    log: SessionLogEntry[];
+    messages: number;
+  };
 }
 
 /**
@@ -144,12 +154,9 @@ export interface SessionEnvelope {
     timestamp: {
       city: string;
       country: string;
-      datetime: {
-        current: string;
-        session: string;
-      };
-      day_of_week: string;
+      current: string;
       is_dst: boolean;
+      session: string;
       timezone: string;
     };
     uuid: string;
@@ -179,7 +186,6 @@ export interface SetResult {
  * status tool result — database snapshot at session start
  */
 export interface StatusResult {
-  context: number;
   schemaVersion: number;
   statistics: {
     cycles: number;
@@ -188,6 +194,13 @@ export interface StatusResult {
     instructions: number;
     observations: number;
     profiles: number;
+  };
+  payload: {
+    context: number;
+    tokens: {
+      total: number;
+      used: number;
+    };
   };
 }
 
@@ -234,7 +247,7 @@ export class Client {
    * @returns {number} Advisory lock key
    */
   private advisoryLockKey(): number {
-    return 0x43435020; // 'CCP ' as hex
+    return 0x43435020;
   }
 
   /**
@@ -272,21 +285,18 @@ export class Client {
     }
     const session_uuid = await this.detectSessionUuid();
     const geo = await this.fetchGeolocation();
-    const time = this.generateTimestamp(geo.timezone);
     const sessionStart = await this.getSessionState(sql, session_uuid);
+    const latestActivity = await this.getLatestActivity(sql, session_uuid);
     return {
       session: {
         profile,
         timestamp: {
           city: geo.city,
           country: geo.country,
-          datetime: {
-            current: time.datetime,
-            session: sessionStart || time.datetime
-          },
-          day_of_week: time.day_of_week,
-          is_dst: time.is_dst,
-          timezone: time.timezone
+          current: Time.toLocal(latestActivity ?? sessionStart ?? new Date(), geo.timezone) ?? '',
+          is_dst: Time.isDst(geo.timezone),
+          session: Time.toLocal(sessionStart ?? new Date(), geo.timezone) ?? '',
+          timezone: geo.timezone
         },
         uuid: session_uuid
       }
@@ -387,14 +397,16 @@ export class Client {
    * `Math.round(totalTokens / contextWindow * 100)`.
    *
    * @private
-   * @returns {Promise<number>} Context usage percentage (0-100), 0 if undetected
+   * @returns {Promise<{ context: number; tokens: { total: number; used: number } }>} Context usage with percentage and absolute token counts
    */
-  private async getContextUsage(): Promise<number> {
+  private async getContextUsage(): Promise<{ context: number; tokens: { total: number; used: number } }> {
+    const total = this.config.contextWindow ?? 1_000_000;
+    const empty = { context: 0, tokens: { total, used: 0 } };
     try {
       const session_uuid = await this.detectSessionUuid();
-      if (!session_uuid) return 0;
+      if (!session_uuid) return empty;
       const transcriptPath = join(this.getTranscriptDir(), `${session_uuid}.jsonl`);
-      if (!existsSync(transcriptPath)) return 0;
+      if (!existsSync(transcriptPath)) return empty;
       const content = readFileSync(transcriptPath, 'utf8');
       const lines = content.trim().split('\n').reverse();
       for (const line of lines) {
@@ -403,19 +415,18 @@ export class Client {
           if (entry.type !== 'assistant') continue;
           const usage = entry.message?.usage;
           if (!usage) continue;
-          const total = (usage.input_tokens ?? 0) +
+          const used = (usage.input_tokens ?? 0) +
             (usage.cache_creation_input_tokens ?? 0) +
             (usage.cache_read_input_tokens ?? 0) +
             (usage.output_tokens ?? 0);
-          const windowSize = this.config.contextWindow ?? 1_000_000;
-          return Math.round((total / windowSize) * 100);
+          return { context: Math.round((used / total) * 100), tokens: { total, used } };
         } catch {
           continue;
         }
       }
-      return 0;
+      return empty;
     } catch {
-      return 0;
+      return empty;
     }
   }
 
@@ -454,12 +465,30 @@ export class Client {
    * @param {string} session_uuid - Session identifier
    * @returns {Promise<{status, sessionStart}>} Session state
    */
-  private async getSessionState(sql: postgres.Sql, session_uuid: string): Promise<string | null> {
+  private async getSessionState(sql: postgres.Sql, session_uuid: string): Promise<Date | null> {
     const rows = await sql<{ created_at: Date }[]>`
       select created_at from session where session_uuid = ${session_uuid}
     `;
-    const row = rows[0];
-    return row?.created_at ? row.created_at.toISOString() : null;
+    return rows[0]?.created_at ?? null;
+  }
+
+  /**
+   * Returns the most recent log activity timestamp for a session
+   *
+   * Reads `MAX(created_at)` from `session_log`. Used as the `current`
+   * marker in the session envelope's timestamp block — when the
+   * conversation last produced a turn, in absolute time.
+   *
+   * @private
+   * @param {postgres.Sql} sql - Connection to the target database
+   * @param {string} session_uuid - Active session UUID
+   * @returns {Promise<Date | null>} Latest log timestamp, or null when no log entries exist
+   */
+  private async getLatestActivity(sql: postgres.Sql, session_uuid: string): Promise<Date | null> {
+    const rows = await sql<{ latest: Date | null }[]>`
+      select max(created_at) as latest from session_log where session_uuid = ${session_uuid}
+    `;
+    return rows[0]?.latest ?? null;
   }
 
   /**
@@ -545,40 +574,6 @@ export class Client {
     }
   }
 
-  /**
-   * Generates a timestamp object with datetime, day_of_week, and DST status
-   *
-   * @param {string} timezone - IANA timezone (e.g., 'America/Toronto')
-   * @returns {object} Timestamp object
-   */
-  generateTimestamp(timezone: string): { datetime: string; display: string; day_of_week: string; is_dst: boolean; timezone: string } {
-    const now = new Date();
-    const formatter = new Intl.DateTimeFormat('en-CA', {
-      timeZone: timezone,
-      year: 'numeric', month: '2-digit', day: '2-digit',
-      hour: '2-digit', minute: '2-digit', second: '2-digit',
-      hour12: false, timeZoneName: 'longOffset'
-    });
-    const parts = formatter.formatToParts(now);
-    const get = (type: string) => parts.find(p => p.type === type)?.value || '';
-    const offsetPart = parts.find(p => p.type === 'timeZoneName')?.value || 'GMT+00:00';
-    const offset = offsetPart.replace('GMT', '') || '+00:00';
-    const datetime = `${get('year')}-${get('month')}-${get('day')}T${get('hour')}:${get('minute')}:${get('second')}${offset}`;
-    const dayFormatter = new Intl.DateTimeFormat('en-US', { timeZone: timezone, weekday: 'long' });
-    const day_of_week = dayFormatter.format(now);
-    const displayFormatter = new Intl.DateTimeFormat('en-US', {
-      timeZone: timezone,
-      weekday: 'long', year: 'numeric', month: 'long', day: 'numeric',
-      hour: 'numeric', minute: '2-digit', hour12: true, timeZoneName: 'short'
-    });
-    const displayParts = displayFormatter.formatToParts(now);
-    const dp = (type: string) => displayParts.find(p => p.type === type)?.value || '';
-    const display = `${dp('weekday')}, ${dp('month')} ${dp('day')}, ${dp('year')}, ${dp('hour')}:${dp('minute')} ${dp('dayPeriod')} ${dp('timeZoneName')}`;
-    const janOffset = new Date(now.getFullYear(), 0, 1).getTimezoneOffset();
-    const julOffset = new Date(now.getFullYear(), 6, 1).getTimezoneOffset();
-    const is_dst = now.getTimezoneOffset() < Math.max(janOffset, julOffset);
-    return { datetime, display, day_of_week, is_dst, timezone };
-  }
 
   /**
    * Gets package version
@@ -605,7 +600,7 @@ export class Client {
    * @param {string} [parent] - Parent name (required for type='profile')
    * @returns {Promise<LoadResult>} The requested framework data
    */
-  async load(type: LoadType, parent?: string): Promise<LoadResult> {
+  async load(type: LoadType, parent?: string, options?: { limit?: number; offset?: number; uuid?: string }): Promise<LoadResult> {
     const sql = this.connect(this.config.database.name);
     try {
       switch (type) {
@@ -877,7 +872,9 @@ export class Client {
           };
         }
         case 'session': {
-          const target_uuid = parent || await this.detectSessionUuid();
+          const target_uuid = options?.uuid ?? await this.detectSessionUuid();
+          const limit = options?.limit ?? 10;
+          const offset = options?.offset ?? 0;
           const sessionRows = await sql<{
             title: string | null;
             description: string | null;
@@ -901,25 +898,34 @@ export class Client {
             select id, message, cycle, feeling, impulse, observation, protocol, created_at
             from session_log
             where session_uuid = ${target_uuid}
-            order by created_at asc
+            order by created_at desc
+            limit ${limit} offset ${offset}
           `;
+          const [{ count: messages }] = await sql<{ count: number }[]>`
+            select count(*)::int as count from session_log where session_uuid = ${target_uuid}
+          `;
+          const geo = await this.fetchGeolocation();
+          const tz = geo.timezone;
           const sessionRow = sessionRows[0];
           const detail: SessionDetail = {
             uuid: target_uuid,
             title: sessionRow?.title ?? null,
             description: sessionRow?.description ?? null,
-            created_at: sessionRow?.created_at ? sessionRow.created_at.toISOString() : null,
-            updated_at: sessionRow?.updated_at ? sessionRow.updated_at.toISOString() : null,
-            log: logRows.map(r => ({
-              response_uuid: r.id,
-              message: r.message,
-              cycle: r.cycle,
-              feeling: r.feeling,
-              impulse: r.impulse,
-              observation: r.observation,
-              protocol: r.protocol,
-              created_at: r.created_at.toISOString()
-            }))
+            created_at: Time.toLocal(sessionRow?.created_at, tz),
+            updated_at: Time.toLocal(sessionRow?.updated_at, tz),
+            payload: {
+              log: logRows.map(r => ({
+                response_uuid: r.id,
+                message: r.message,
+                cycle: r.cycle,
+                feeling: r.feeling,
+                impulse: r.impulse,
+                observation: r.observation,
+                protocol: r.protocol,
+                created_at: Time.toLocal(r.created_at, tz) ?? ''
+              })),
+              messages
+            }
           };
           return { type: 'session', session: detail };
         }
@@ -950,7 +956,6 @@ export class Client {
     const id = crypto.randomUUID();
     const session_uuid = await this.detectSessionUuid();
     const geo = await this.fetchGeolocation();
-    const time = this.generateTimestamp(geo.timezone);
     const sql = this.connect(this.config.database.name);
     try {
       await sql`
@@ -964,8 +969,8 @@ export class Client {
         observations: args.status.observation.length,
         protocol: args.status.protocol
       });
-      const context = await this.getContextUsage();
-      return { context, status, timestamp: time.datetime };
+      const usage = await this.getContextUsage();
+      return { payload: { context: usage.context, status, tokens: usage.tokens }, timestamp: Time.toLocal(new Date(), geo.timezone) ?? '' };
     } finally {
       await sql.end({ timeout: 5 });
     }
@@ -980,7 +985,7 @@ export class Client {
    * @returns {string} Single-line block ready to render verbatim at response top
    */
   private renderProfile(profile: string, display: string): string {
-    return `┃ 📋 Profile: **${profile}** ○  ${display}`;
+    return `┃ 📋 Profile: **${profile}** ○ ${display}`;
   }
 
   /**
@@ -1000,7 +1005,7 @@ export class Client {
     const i = `${status.impulses} ${status.impulses === 1 ? 'impulse' : 'impulses'}`;
     const o = `${status.observations} ${status.observations === 1 ? 'observation' : 'observations'}`;
     return [
-      `┃ ${status.protocol} Status: **${status.cycle}** ○  ${f} ○  ${i} ○  ${o}`,
+      `┃ ${status.protocol} Status: **${status.cycle}** ○ ${f} ○ ${i} ○ ${o}`,
       `┃ ⚙️ Response UUID: \`${id}\``
     ].join('\n');
   }
@@ -1036,8 +1041,8 @@ export class Client {
           throw new Error('render(profile) requires either a value argument or CCP_PROFILE environment variable');
         }
         const geo = await this.fetchGeolocation();
-        const time = this.generateTimestamp(geo.timezone);
-        return { profile: this.renderProfile(profile, time.display) };
+        const display = Time.toDisplay(new Date(), geo.timezone) ?? '';
+        return { profile: this.renderProfile(profile, display) };
       }
     }
   }
@@ -1063,9 +1068,9 @@ export class Client {
       case 'session': {
         const session_uuid = await this.detectSessionUuid();
         const geo = await this.fetchGeolocation();
-        const time = this.generateTimestamp(geo.timezone);
+        const display = Time.toDisplay(new Date(), geo.timezone) ?? '';
         const defaultTitle = 'Collaboration Session';
-        const defaultDescription = `Session started on ${time.display}`;
+        const defaultDescription = `Session started on ${display}`;
         const payload = args.payload ?? {};
         const sql = this.connect(this.config.database.name);
         try {
@@ -1094,8 +1099,8 @@ export class Client {
               ...envelope.session,
               title: row.title,
               description: row.description,
-              created_at: row.created_at.toISOString(),
-              updated_at: row.updated_at.toISOString()
+              created_at: Time.toLocal(row.created_at, geo.timezone) ?? '',
+              updated_at: Time.toLocal(row.updated_at, geo.timezone) ?? ''
             }
           };
         } finally {
@@ -1124,11 +1129,11 @@ export class Client {
       const [{ count: instructions }] = await sql<{ count: number }[]>`select count(distinct parent)::int as count from observation where type = 'instruction'`;
       const [{ count: observations }] = await sql<{ count: number }[]>`select count(*)::int as count from observation`;
       const [{ count: profiles }] = await sql<{ count: number }[]>`select count(*)::int as count from profile`;
-      const context = await this.getContextUsage();
+      const usage = await this.getContextUsage();
       return {
-        context,
         schemaVersion,
-        statistics: { cycles, feelings, impulses, instructions, observations, profiles }
+        statistics: { cycles, feelings, impulses, instructions, observations, profiles },
+        payload: { context: usage.context, tokens: usage.tokens }
       };
     } finally {
       await sql.end({ timeout: 5 });
