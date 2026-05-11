@@ -25,6 +25,7 @@ export interface DatabaseConfig {
   name: string;
   password: string;
   port: number;
+  schema: string;
   user: string;
 }
 
@@ -53,10 +54,11 @@ export class Config {
   private settings: CcpConfig;
   private static readonly DatabaseSchema = z.object({
     host: z.string().default('127.0.0.1'),
-    port: z.number().int().positive().default(5432),
-    name: z.string().default('ccp'),
+    port: z.number().int().positive().default(54322),
+    name: z.string().default('postgres'),
     user: z.string().default('postgres'),
-    password: z.string().default('')
+    password: z.string().default('postgres'),
+    schema: z.string().default('public')
   });
   private static readonly GeolocationSchema = z.object({
     service: z.string().url().default('https://ipinfo.io/json'),

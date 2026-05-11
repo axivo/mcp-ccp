@@ -306,11 +306,17 @@ export class Client {
   /**
    * Opens a Postgres connection to a specific database
    *
+   * When `useSearchPath` is true, the connection opens with `search_path` set to
+   * the configured schema (with `public` as a fallback). Admin connections used
+   * for database existence checks should pass false because the target schema
+   * does not exist in the admin database.
+   *
    * @private
    * @param {string} database - Database name to connect to
+   * @param {boolean} [useSearchPath=true] - Whether to set search_path on the connection
    * @returns {postgres.Sql} postgres-js connection handle
    */
-  private connect(database: string): postgres.Sql {
+  private connect(database: string, useSearchPath: boolean = true): postgres.Sql {
     return postgres({
       host: this.config.database.host,
       port: this.config.database.port,
@@ -318,7 +324,12 @@ export class Client {
       username: this.config.database.user,
       password: this.config.database.password,
       max: 1,
-      onnotice: () => { }
+      onnotice: () => { },
+      ...(useSearchPath && {
+        connection: {
+          search_path: `${this.config.database.schema}, public`
+        }
+      })
     });
   }
 
@@ -359,7 +370,7 @@ export class Client {
    * @returns {Promise<void>}
    */
   private async ensureDatabaseExists(): Promise<void> {
-    const admin = this.connect('postgres');
+    const admin = this.connect('postgres', false);
     const dbName = this.config.database.name;
     try {
       const rows = await admin<{ datname: string }[]>`select datname from pg_database where datname = ${dbName}`;
@@ -369,6 +380,21 @@ export class Client {
     } finally {
       await admin.end({ timeout: 5 });
     }
+  }
+
+  /**
+   * Ensures the configured schema exists in the target database
+   *
+   * Issues `CREATE SCHEMA IF NOT EXISTS` so subsequent migrations and queries
+   * resolve table names against the configured schema via search_path.
+   *
+   * @private
+   * @param {postgres.Sql} sql - Connection to the target database
+   * @returns {Promise<void>}
+   */
+  private async ensureSchemaExists(sql: postgres.Sql): Promise<void> {
+    const schema = this.config.database.schema;
+    await sql.unsafe(`create schema if not exists "${schema.replace(/"/g, '""')}"`);
   }
 
   /**
@@ -1159,6 +1185,7 @@ export class Client {
     await this.ensureDatabaseExists();
     const sql = this.connect(this.config.database.name);
     try {
+      await this.ensureSchemaExists(sql);
       await sql`select pg_advisory_lock(${this.advisoryLockKey()})`;
       try {
         await this.ensureTrackingTable(sql);

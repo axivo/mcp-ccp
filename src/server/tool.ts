@@ -49,6 +49,7 @@ export class McpTool {
         openWorldHint: false
       },
       _meta: {
+        'anthropic/maxResultSizeChars': 500000,
         usage: [
           'Call once per `type` at session start to assemble framework state',
           'Pass `cycle` `feeling` `impulse` or `instruction` to fetch full catalog',
