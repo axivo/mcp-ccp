@@ -55,6 +55,25 @@ function loadConfigFromFile(): unknown {
 }
 
 /**
+ * Maps `CCP_DB_OPTIONS` to `PGOPTIONS` before any Postgres connection opens
+ *
+ * `postgres-js` inherits `PGOPTIONS` from `process.env` per libpq convention
+ * and applies it at every connection's session startup. The namespaced
+ * `CCP_DB_OPTIONS` alias lets users scope libpq startup parameters per MCP
+ * server inside their `mcp.json` env block instead of relying on shell-level
+ * environment, which would apply to every Postgres consumer in the process.
+ *
+ * If both variables are set, `CCP_DB_OPTIONS` wins so per-server config in
+ * `mcp.json` takes precedence over the shell default.
+ */
+function applyDbOptionsEnv(): void {
+  const ccpOptions = process.env.CCP_DB_OPTIONS;
+  if (ccpOptions) {
+    process.env.PGOPTIONS = ccpOptions;
+  }
+}
+
+/**
  * Main entry point for the CCP MCP Server (stdio transport)
  *
  * @async
@@ -62,6 +81,7 @@ function loadConfigFromFile(): unknown {
  * @throws {Error} When server initialization fails
  */
 async function main(): Promise<void> {
+  applyDbOptionsEnv();
   process.on('uncaughtException', (error) => {
     console.error('Uncaught exception:', error.message);
     if (error.message.includes('EPIPE') || (error as any).code === 'EPIPE') {

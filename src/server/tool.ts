@@ -7,6 +7,7 @@
  */
 
 import { z } from 'zod';
+import { Config } from './config.js';
 
 /**
  * MCP Tool Definitions for CCP Integration
@@ -21,9 +22,22 @@ import { z } from 'zod';
  * (not annotated as a wide alias) so TypeScript can capture each tool's
  * specific input shape and propagate it to the handler signature.
  *
+ * Reads the active `Config` instance to source the result size cap
+ * advertised on the `load` tool's `_meta` block.
+ *
  * @class McpTool
  */
 export class McpTool {
+  private config: Config;
+
+  /**
+   * Creates a new McpTool registry bound to the active configuration
+   *
+   * @param {Config} config - CCP configuration instance
+   */
+  constructor(config: Config) {
+    this.config = config;
+  }
   /**
    * Creates MCP tool for loading framework data of a given type
    *
@@ -49,7 +63,7 @@ export class McpTool {
         openWorldHint: false
       },
       _meta: {
-        'anthropic/maxResultSizeChars': 500000,
+        'anthropic/maxResultSizeChars': this.config.mcp.sizeChars,
         usage: [
           'Call once per `type` at session start to assemble framework state',
           'Pass `cycle` `feeling` `impulse` or `instruction` to fetch full catalog',

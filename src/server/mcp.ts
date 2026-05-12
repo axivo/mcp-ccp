@@ -45,7 +45,7 @@ export class Mcp {
       { name: 'ccp', version: this.client.getVersion() },
       { capabilities: { tools: {} } }
     );
-    this.tool = new McpTool();
+    this.tool = new McpTool(this.config);
     this.registerAll();
   }
 

@@ -15,6 +15,7 @@ export interface CcpConfig {
   contextWindow: number;
   database: DatabaseConfig;
   geolocation: GeolocationConfig;
+  mcp: McpConfig;
 }
 
 /**
@@ -36,6 +37,16 @@ export interface GeolocationConfig {
   fallbackTimezone: string;
   override?: string;
   service: string;
+}
+
+/**
+ * MCP server limits
+ *
+ * `sizeChars` is the per-tool Anthropic result size cap advertised in
+ * the `_meta` block of tool definitions.
+ */
+export interface McpConfig {
+  sizeChars: number;
 }
 
 /**
@@ -65,14 +76,19 @@ export class Config {
     override: z.string().optional(),
     fallbackTimezone: z.string().default('UTC')
   });
+  private static readonly McpSchema = z.object({
+    sizeChars: z.number().int().positive().default(500000)
+  });
   private static readonly ConfigSchema = z.object({
     contextWindow: z.number().int().positive().default(1_000_000),
     database: Config.DatabaseSchema.optional(),
-    geolocation: Config.GeolocationSchema.optional()
+    geolocation: Config.GeolocationSchema.optional(),
+    mcp: Config.McpSchema.optional()
   }).transform(data => ({
     contextWindow: data.contextWindow,
     database: data.database ?? Config.DatabaseSchema.parse({}),
-    geolocation: data.geolocation ?? Config.GeolocationSchema.parse({})
+    geolocation: data.geolocation ?? Config.GeolocationSchema.parse({}),
+    mcp: data.mcp ?? Config.McpSchema.parse({})
   }));
 
   /**
@@ -140,6 +156,17 @@ export class Config {
    */
   get geolocation(): GeolocationConfig {
     return this.settings.geolocation;
+  }
+
+  /**
+   * Returns MCP server limits
+   *
+   * Default is `sizeChars: 500000`.
+   *
+   * @returns {McpConfig} MCP settings
+   */
+  get mcp(): McpConfig {
+    return this.settings.mcp;
   }
 }
 
