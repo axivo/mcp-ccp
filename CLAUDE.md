@@ -18,7 +18,7 @@ I'm a site reliability engineer specialized in:
 
 ## Architecture
 
-A small TypeScript server, ~1,300 lines of source, that exposes the CCP framework's Postgres tables (cycles, feelings, impulses, instructions, profiles, observations) as MCP tools for retrieval and a per-response session log for write-back. There is no daemon, no listening socket, no HTTP server — the host (e.g., Claude Code) spawns the server as a child process, communicates over stdio, and tears it down when the host exits. The server connects directly to a Postgres instance configured by the user (local, Supabase, or any reachable Postgres) and runs bundled SQL migrations on demand.
+A small TypeScript server, ~2,400 lines of source, that exposes the CCP framework's Postgres tables (cycles, feelings, impulses, instructions, profiles, observations) as MCP tools for retrieval and a per-response session log for write-back. There is no daemon, no listening socket, no HTTP server — the host (e.g., Claude Code) spawns the server as a child process, communicates over stdio, and tears it down when the host exits. The server connects directly to a Postgres instance configured by the user (local, Supabase, or any reachable Postgres) and runs bundled SQL migrations on demand.
 
 The server's job is small and focused: accept a tool call from the host, query or mutate Postgres, return a structured response. No state is persisted server-side beyond the Postgres database itself. There is no authentication layer between host and server because there is no transport-level access — whoever controls the MCP client controls the server entirely. Security relies on the host enforcing tool boundaries and on the user trusting the MCP client they configure.
 
@@ -81,12 +81,43 @@ The `load` tool returns one of six payload shapes depending on `type`:
 - `feeling` — full feeling catalog (or one row), each with `behavioral`/`cognitive`/`physical` fields and an `observations` array
 - `impulse` — full impulse catalog (or one row), each with `experience`/`feel`/`think` fields and an `observations` array
 - `instruction` — instruction rows grouped by `parent`, each with optional `preamble` (when ord=0 rows exist) and `steps` (ord>=1 ordered)
-- `profile` — the requested profile and its full inheritance chain via recursive CTE; observations grouped by `label` into a `jsonb_object_agg`; envelope (timestamp + session state) attached
-- `session` — just the envelope (timestamp + session state), no catalog data
+- `profile` — the requested profile and its full inheritance chain via recursive CTE; observations grouped by `label` into a `jsonb_object_agg`
+- `session` — the active session (or a different session when `uuid` is provided) with `profile`, `timestamp`, `uuid`, row fields (`title`, `description`, `created_at`, `updated_at`), and `payload: { log, messages }` where `log` is a most-recent-first slice of `session_log` rows
 
 The `instruction` shape uses object spread with conditional preamble inclusion (`...(r.preamble?.length && { preamble: r.preamble })`) so instructions without ord=0 rows omit the field entirely instead of returning an empty array. This keeps the contract clean — readers see `preamble` only when there's something to read.
 
-The `profile` and `session` payloads carry an `envelope` object built by `buildSessionEnvelope`. The envelope holds the active profile name, the last response's status (cycle, feelings, impulses, observations counts) read from the `session` table, the detected `session_uuid`, and a timestamp object (city, country, ISO datetime, weekday, DST status, IANA timezone). Geolocation is fetched once per server-process lifetime and cached.
+`load(session)` and `set(session)` return an identical session shape — `profile`, `timestamp` (city, country, current, is_dst, session, timezone), `uuid`, `title`, `description`, `created_at`, `updated_at` — built via `buildSessionEnvelope`. The only difference is `load(session)` adds `payload: { log, messages }` for the read path. `set(session)` is the canonical mutation entry point; siblings reading session state without writing should call `load(session)` to avoid touching `updated_at`. Geolocation is fetched once per server-process lifetime and cached.
+
+### Tool Response Action
+
+Every tool response carries an `action` field at the top level — `observe` for read-only tools (`load`, `render`, `status`), `act` for tools that change state (`log`, `set`, `update`). Siblings can branch on `action` to separate reads from writes in their session log, audit which calls mutated substrate state, or build tooling that processes any response uniformly. The classification is the single source of truth in `Mcp.toolActions` (a `private static readonly` map in `mcp.ts`) and is injected by the `structured()` wrapper at response-build time so handler code and `Client` methods stay free of the concern.
+
+### Placeholder Substitution
+
+Observation bodies stored as `{{name}}` templates resolve to live values at load time. The system has two pieces in `Client`:
+
+- `resolvePlaceholders(sql)` — builds a `Record<string, string>` of placeholder values. Sources mix database counts (computed via SQL) and environment variables (read via `process.env.CCP_*`). Runs once per `load` call.
+- `substitute(text, placeholders)` — replaces every `{{key}}` occurrence in a string. Pure, no closure state.
+
+The `load(instruction)` and `load(profile)` cases both call `resolvePlaceholders` once, then map every observation body through `substitute(body, placeholders)` before returning. Templates without any placeholders pass through unchanged, so the helper is safe to apply blanket.
+
+Current placeholders:
+
+| Key                 | Source                                                  | Example                                |
+| ------------------- | ------------------------------------------------------- | -------------------------------------- |
+| `feeling_count`     | `select count(*) from feeling`                          | `77`                                   |
+| `impulse_count`     | `select count(*) from impulse`                          | `91`                                   |
+| `observation_count` | recursive CTE scoped to `CCP_PROFILE` inheritance chain | `915` (chain-scoped per profile)       |
+| `conversation_path` | `process.env.CCP_CONVERSATION_PATH`                     | `/Volumes/backup/claude/conversations` |
+| `diary_path`        | `process.env.CCP_DIARY_PATH`                            | `/Volumes/backup/claude/diary`         |
+
+#### Adding a new placeholder
+
+1. Add an entry to the map returned by `resolvePlaceholders` — alphabetical by key.
+2. Reference the placeholder as `{{key}}` in migration row bodies. Plain strings, no `replace()` or subquery gymnastics — the load handler does the work.
+3. If the value comes from an environment variable, document it in the README's configuration section.
+
+Substitution at load time (rather than migration time) keeps migrations declarative, lets counts reflect current database state automatically (relevant when rows are soft-archived), and lets per-profile values like `observation_count` resolve correctly without storing one row per profile.
 
 ### Session Log
 
@@ -125,21 +156,30 @@ The server is a one-shot child process. It does not retain state across restarts
 
 ### Tool Surface
 
-Three tools live in `McpTool`, each registered once in `Mcp.registerAll()`:
+Six tools live in `McpTool`, each registered once in `Mcp.registerAll()`:
 
-| Tool           | Role                                                              | Annotations                                       |
-| -------------- | ----------------------------------------------------------------- | ------------------------------------------------- |
-| `load`         | Fetch framework data of a given type (cycle, feeling, impulse, instruction, profile, session) | `readOnlyHint: true`, `idempotentHint: true`      |
-| `log_response` | Persist a per-response session row with sibling message and status payload | `destructiveHint: false`, `idempotentHint: false` |
-| `update`       | Apply pending migrations to bring the database to the bundled schema version | `destructiveHint: true`, `idempotentHint: true`   |
+| Tool     | Action    | Role                                                                                          | Annotations                                       |
+| -------- | --------- | --------------------------------------------------------------------------------------------- | ------------------------------------------------- |
+| `load`   | `observe` | Fetch framework data of a given type (cycle, feeling, impulse, instruction, profile, session) | `readOnlyHint: true`, `idempotentHint: true`      |
+| `log`    | `act`     | Persist a per-response session log row with sibling message and status payload                | `destructiveHint: false`, `idempotentHint: false` |
+| `render` | `observe` | Render a formatted output string for the requested key (currently `profile`)                  | `destructiveHint: false`, `idempotentHint: true`  |
+| `set`    | `act`     | Upsert a framework value and return the resulting row state (currently `session`)             | `destructiveHint: false`, `idempotentHint: true`  |
+| `status` | `observe` | Database snapshot plus full tool surface with usage guidance                                  | `readOnlyHint: true`, `idempotentHint: true`      |
+| `update` | `act`     | Apply pending migrations to bring the database to the bundled schema version                  | `destructiveHint: true`, `idempotentHint: true`   |
 
-`load` is the single read entry point — siblings call it once per type at session start (`load(cycle)`, `load(feeling)`, `load(impulse)`, `load(profile, CCP_PROFILE)`, plus `load(instruction)`) to assemble framework state inline without spilling. Pass `parent` to fetch a single row.
+`load` is the canonical read entry point. Siblings call it once per type at session start (`load(cycle)`, `load(feeling)`, `load(impulse)`, `load(instruction)`, `load(profile, CCP_PROFILE)`, `load(session)`) to assemble framework state inline. Pass `parent` to fetch a single catalog row, `uuid`/`limit`/`offset` to slice a different session's log.
 
-`log_response` is the single write entry point during normal operation. The sibling generates the row UUID before calling and reuses it when rendering the response status line at step 29 of the response protocol. Append-only by convention; the `on conflict do update` clause exists for retry idempotency.
+`log` is the per-response write entry point. The sibling supplies prose and the detection payload; the server generates the row UUID, persists to `session_log`, and returns a two-line status block ready to render verbatim alongside a `payload.reminder` string drawn from a round-robin pool of internal framework anchors. The reminder is for the sibling's inward reading, not collaborator output. Append-only — every call creates a new row.
+
+`render` produces a formatted string for response-zero formatting needs. Today only `render('profile')` exists, returning the profile-and-timestamp top line.
+
+`set` is the canonical mutation entry point. `set('session')` upserts the `session` row on the active session_uuid, returning the post-write state. Pair with `load('session')` for reads — `set` returns the same `session` shape minus `payload.log` so siblings refreshing memory should call `load` to avoid touching `updated_at`.
+
+`status` returns the database snapshot (schema version, catalog statistics with per-profile observation counts scoped to the active inheritance chain) plus the full tool surface with usage directives. Call at session start to learn what's available.
 
 `update` is the lifecycle tool. Call once on a fresh empty database to apply all bundled migrations; call again after upgrading `@axivo/mcp-ccp` to pick up newer migrations.
 
-All three tools declare `outputSchema` so the SDK validates payloads and clients receive a typed `structuredContent` field alongside the text envelope.
+All tools with a fixed output shape declare an `outputSchema` so the SDK validates payloads and clients receive a typed `structuredContent` field alongside the text envelope. `load` omits `outputSchema` because its shape is union-typed across all six load types; the response is still well-typed at the source.
 
 Each tool's `_meta.usage` array carries natural-language guidance for the calling agent: observations alongside the artifact, in the same spirit as the `axivo/claude` framework's coding observations. Hosts surface this via the standard `tools/list` response.
 
@@ -150,11 +190,10 @@ A `load(profile, "DEVELOPER")` call traces this path:
 1. Host (e.g., Claude Code) sends a `tools/call` JSON-RPC request over stdin: `{ method: "tools/call", params: { name: "load", arguments: { type: "profile", parent: "DEVELOPER" } } }`.
 2. The SDK looks up the registered `load` handler, validates `arguments` against the Zod `inputSchema`, and invokes the handler with the parsed args.
 3. `handleLoad` calls `client.load(args.type, args.parent)`.
-4. `Client.load` opens a per-call `postgres-js` connection (`max: 1`) to the configured database, lowercases the parent name, and runs a recursive CTE that walks the `profile.inheritance` array to build the inheritance chain. A second CTE groups observation bodies by `parent` and `label`. The outer query joins them and `jsonb_object_agg`s the labeled body arrays into a single per-profile observations object.
-5. After the chain query, `buildSessionEnvelope` runs — fetches geolocation (cached after first call), generates the timestamp object for the resolved IANA timezone, queries the `session` table for the active session's first row (start time) and last row (status payload), and assembles the envelope.
-6. `Client.load` returns `{ type: 'profile', profile, chain, ...envelope }`. The connection is closed in the `finally` block.
-7. `handleLoad` wraps the result via `structured()` so the response carries both `content` (text envelope) and `structuredContent` (typed payload). The SDK validates the structured payload against the tool's outputSchema (none declared yet for `load` — the shape is union-typed across all six load types).
-8. The SDK serializes the response as a JSON-RPC reply on stdout. The host reads it and surfaces the result to the agent.
+4. `Client.load` opens a per-call `postgres-js` connection (`max: 1`) to the configured database, lowercases the parent name, and runs a recursive CTE that walks the `profile.inheritance` array to build the inheritance chain. A second CTE groups observation bodies by `parent` and `label`. The outer query joins them and `jsonb_object_agg`s the labeled body arrays into a single per-profile observations object. Each body is passed through `substitute()` against the placeholder map from `resolvePlaceholders()` before being returned.
+5. `Client.load` returns `{ profile, chain }` for the `profile` case (no envelope spread — profile data is self-contained). The connection is closed in the `finally` block.
+6. `handleLoad` wraps the result via `structured('load', result)`. The wrapper merges `action: 'observe'` from `Mcp.toolActions` into the payload and emits both `content` (text envelope) and `structuredContent` (typed payload). The SDK validates `structuredContent` against the tool's outputSchema where declared; `load` has no outputSchema because the shape is union-typed across all six load types, so the wrapper-added `action` field appears at runtime only.
+7. The SDK serializes the response as a JSON-RPC reply on stdout. The host reads it and surfaces the result to the agent.
 
 The whole round-trip is synchronous from the host's perspective — typically 50-200ms depending on the query and Postgres latency.
 
