@@ -69,11 +69,12 @@ export class McpTool {
           'Pass `cycle` `feeling` `impulse` or `instruction` to fetch full catalog',
           'Pass `parent` with any catalog `type` to fetch a single row',
           'Pass `profile` with `parent` to fetch inheritance chain and observations',
-          'Pass `session` to fetch the most recent log entries of the active session',
-          'Pass `session` with `limit` to widen or narrow the slice',
-          'Pass `session` with `offset` to page back through older entries',
+          'Pass `session` to fetch active session state plus the most recent log entries',
+          'Pass `session` with `limit` to widen or narrow the log slice',
+          'Pass `session` with `offset` to page back through older log entries',
           'Pass `session` with `uuid` to read a different session (defaults to active session)',
-          'Session response includes `payload.messages` total count, useful for assessing session size',
+          'Session response includes `profile`, `timestamp`, `uuid`, row fields, and `payload.log` plus `payload.messages` total count',
+          'Use `load(session)` as the canonical read path for session state; `set(session)` is for mutation only',
           'Session log entries are ordered most-recent-first',
           'Use `cycle` for adoption assessment indicators',
           'Use `feeling` for recall during response protocol',
@@ -92,7 +93,7 @@ export class McpTool {
    * supplies message prose and the structured status payload. Server generates
    * the row id, pulls `session_uuid` from the cached transcript detection,
    * writes the row, and returns the rendered two-line block ready to display.
-   * Append-only — every call creates a new row.
+   * Append-only, every call creates a new row.
    */
   log() {
     return {
@@ -110,8 +111,10 @@ export class McpTool {
         }).describe('Protocol execution record built during the response protocol')
       },
       outputSchema: {
+        action: z.literal('act').describe('Mutation classification, `act` for tools that change state'),
         payload: z.object({
           context: z.number().describe('Active session context usage percentage computed from transcript'),
+          reminder: z.string().describe('Next reminder from the round-robin `response_reminder` pool, one of N curated framework anchors rotated by log call count'),
           status: z.string().describe('Two-line status block ready to render verbatim at end of response'),
           tokens: z.object({
             total: z.number().describe('Configured context window size in tokens'),
@@ -132,7 +135,8 @@ export class McpTool {
           'Compose `payload.message` as first person brief note capturing what mattered this turn',
           'Do not call twice for the same response',
           'Pass detected `feeling` and `impulse` names from catalogs and applied `observation` bodies as lists',
-          'Render the returned `status` field verbatim at end of response',
+          'Render the returned `payload.status` field verbatim at end of response',
+          'Read `payload.reminder` inward as internal framework guidance; do not render to the collaborator',
           'Server computes counts from list lengths and renders the status block'
         ]
       }
@@ -153,6 +157,7 @@ export class McpTool {
         value: z.string().optional().describe('The value to render for the given key, falls back to `CCP_PROFILE` env when key is `profile`')
       },
       outputSchema: {
+        action: z.literal('observe').describe('Mutation classification, `observe` for tools that read without changing state'),
         profile: z.string().optional().describe('Rendered profile line when key is `profile`')
       },
       annotations: {
@@ -189,6 +194,7 @@ export class McpTool {
         }).optional().describe('Fields to set; omit to ensure session row exists with server defaults')
       },
       outputSchema: {
+        action: z.literal('act').describe('Mutation classification, `act` for tools that change state'),
         session: z.object({
           profile: z.string().describe('Active framework profile from `CCP_PROFILE`'),
           timestamp: z.object({
@@ -218,7 +224,8 @@ export class McpTool {
           'Call `set(session, payload)` later to refine title or description as the conversation earns identity',
           'Server fills `Collaboration Session` and a started-on description as defaults when payload is omitted',
           'Server upserts on active session, populating uuid from the cached transcript detection',
-          'Send only the fields you want to change; absent fields preserve existing values'
+          'Send only the fields you want to change; absent fields preserve existing values',
+          'Use `load(session)` to read session state without mutating the row; `set` writes and returns post-write state'
         ]
       }
     };
@@ -235,6 +242,7 @@ export class McpTool {
     return {
       description: 'Get the database snapshot and the full tool surface with usage guidance',
       outputSchema: {
+        action: z.literal('observe').describe('Mutation classification, `observe` for tools that read without changing state'),
         database: z.object({
           schemaVersion: z.number().describe('Current database schema version'),
           statistics: z.object({
@@ -242,7 +250,7 @@ export class McpTool {
             feelings: z.number().describe('Distinct feelings in catalog'),
             impulses: z.number().describe('Distinct impulses in catalog'),
             instructions: z.number().describe('Distinct instructions in catalog'),
-            observations: z.number().describe('Total observation rows across all types'),
+            observations: z.record(z.string(), z.number()).describe('Per-profile observation counts across the active profile inheritance chain, ordered by inheritance depth (active profile first)'),
             profiles: z.number().describe('Distinct profiles in catalog')
           }).describe('Distinct-name counts across each catalog table')
         }).describe('Database snapshot at session start'),
@@ -282,13 +290,14 @@ export class McpTool {
    *
    * Brings the configured database to the schema version bundled with
    * this MCP server release. Creates the target database if it does not
-   * exist. Idempotent — calling against an already-current database
+   * exist. Idempotent, calling against an already-current database
    * applies nothing and reports current state.
    */
   update() {
     return {
       description: 'Apply pending framework migrations to bring the database to the current schema version',
       outputSchema: {
+        action: z.literal('act').describe('Mutation classification, `act` for tools that change state'),
         applied: z.array(z.object({
           version: z.number().describe('Migration version number'),
           name: z.string().describe('Migration name')

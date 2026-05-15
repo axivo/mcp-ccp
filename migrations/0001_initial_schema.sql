@@ -12,6 +12,12 @@ create table if not exists platform_migrations (
   applied_at  timestamptz not null default now()
 );
 
+create table if not exists platform_repeatable (
+  name        text primary key,
+  checksum    text not null,
+  applied_at  timestamptz not null default now()
+);
+
 -- -----------------------------------------------------------------------------
 -- Enums
 -- -----------------------------------------------------------------------------

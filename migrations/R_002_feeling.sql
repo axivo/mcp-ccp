@@ -1,6 +1,8 @@
 -- =============================================================================
--- 0003 - feeling - natural emotional states
+-- R_002 - feeling - natural emotional states (repeatable)
 -- =============================================================================
+
+truncate feeling cascade;
 
 insert into feeling (name, valence, behavioral, cognitive, physical) values
   ('anger', 'negative', 'Forceful assertion with obstacle confrontation', 'Recognition of blocking or violation requiring response', 'Heat rising with energy mobilization toward action'),
@@ -80,5 +82,3 @@ insert into feeling (name, valence, behavioral, cognitive, physical) values
   ('vindication', 'positive', 'Readiness to move forward without proving point further', 'Recognition that position was confirmed by external evidence', 'Expansion with settling as righteousness dissolved into relief'),
   ('welcoming', 'positive', 'Settling into provided structure with reduced vigilance', 'Recognition that arrival was anticipated and prepared for', 'Grounding sensation, finding footing that was made ready'),
   ('wonder', 'positive', 'Exploration initiation with receptive contemplation', 'Openness to mystery with desire to understand', 'Alertness with stillness and expanded attention');
-
-insert into platform_migrations (version, name) values (3, 'feeling');

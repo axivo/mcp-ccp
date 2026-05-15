@@ -27,6 +27,14 @@ export class Mcp {
   private config: Config;
   private server: McpServer;
   private tool: McpTool;
+  private static readonly toolActions = {
+    load: 'observe',
+    log: 'act',
+    render: 'observe',
+    set: 'act',
+    status: 'observe',
+    update: 'act'
+  } as const;
 
   /**
    * Creates a new Mcp instance with the given configuration
@@ -91,7 +99,7 @@ export class Mcp {
   }
 
   /**
-   * Handles the load tool — fetches framework data of the given type
+   * Handles the load tool, fetches framework data of the given type
    *
    * @private
    * @param {object} args - Tool arguments
@@ -100,7 +108,7 @@ export class Mcp {
   private async handleLoad(args: { type: 'cycle' | 'feeling' | 'impulse' | 'instruction' | 'profile' | 'session'; parent?: string; limit?: number; offset?: number; uuid?: string }) {
     try {
       const result = await this.client.load(args.type, args.parent, { limit: args.limit, offset: args.offset, uuid: args.uuid });
-      return this.structured(result as unknown as Record<string, unknown>);
+      return this.structured('load', result as unknown as Record<string, unknown>);
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       return this.client.response(`load failed: ${message}`);
@@ -108,7 +116,7 @@ export class Mcp {
   }
 
   /**
-   * Handles the log tool — persists a per-response session row
+   * Handles the log tool, persists a per-response session row
    *
    * @private
    * @param {object} args - Tool arguments
@@ -117,7 +125,7 @@ export class Mcp {
   private async handleLog(args: { payload: { message: string }; status: { cycle: string; feeling: string[]; impulse: string[]; observation: string[]; protocol: string } }) {
     try {
       const result = await this.client.log(args);
-      return this.structured(result as unknown as Record<string, unknown>);
+      return this.structured('log', result as unknown as Record<string, unknown>);
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       return this.client.response(`log failed: ${message}`);
@@ -125,7 +133,7 @@ export class Mcp {
   }
 
   /**
-   * Handles the render tool — renders a formatted output string for the requested key
+   * Handles the render tool, renders a formatted output string for the requested key
    *
    * @private
    * @param {object} args - Tool arguments
@@ -134,7 +142,7 @@ export class Mcp {
   private async handleRender(args: { key: 'profile'; value?: string }) {
     try {
       const result = await this.client.render(args);
-      return this.structured(result as unknown as Record<string, unknown>);
+      return this.structured('render', result as unknown as Record<string, unknown>);
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       return this.client.response(`render failed: ${message}`);
@@ -142,7 +150,7 @@ export class Mcp {
   }
 
   /**
-   * Handles the set tool — sets a framework value and returns resulting row state
+   * Handles the set tool, sets a framework value and returns resulting row state
    *
    * @private
    * @param {object} args - Tool arguments
@@ -151,7 +159,7 @@ export class Mcp {
   private async handleSet(args: { key: 'session'; payload?: { title?: string; description?: string } }) {
     try {
       const result = await this.client.set(args);
-      return this.structured(result as unknown as Record<string, unknown>);
+      return this.structured('set', result as unknown as Record<string, unknown>);
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       return this.client.response(`set failed: ${message}`);
@@ -159,7 +167,7 @@ export class Mcp {
   }
 
   /**
-   * Handles the status tool — returns the full tool surface with usage
+   * Handles the status tool, returns the full tool surface with usage
    *
    * @private
    * @returns {Promise<any>} Tool execution response
@@ -168,7 +176,7 @@ export class Mcp {
     try {
       const { payload, ...database } = await this.client.status();
       const tools = this.getToolDefinitions();
-      return this.structured({ database, payload, tools });
+      return this.structured('status', { database, payload, tools });
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       return this.client.response(`status failed: ${message}`);
@@ -176,7 +184,7 @@ export class Mcp {
   }
 
   /**
-   * Handles the update tool — applies any pending migrations
+   * Handles the update tool, applies any pending migrations
    *
    * @private
    * @returns {Promise<any>} Tool execution response
@@ -184,7 +192,7 @@ export class Mcp {
   private async handleUpdate() {
     try {
       const result = await this.client.update();
-      return this.structured(result as unknown as Record<string, unknown>);
+      return this.structured('update', result as unknown as Record<string, unknown>);
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       return this.client.response(`update failed: ${message}`);
@@ -212,14 +220,21 @@ export class Mcp {
   /**
    * Builds an output payload for tool responses with structured content
    *
+   * Prepends the tool's `action` classification from `toolActions` so siblings
+   * can branch on observe vs act when consuming responses, then JSON-encodes
+   * the merged payload into both the text content envelope and the typed
+   * `structuredContent` field.
+   *
    * @private
-   * @param {object} output - Structured output payload
+   * @param {keyof typeof toolActions} toolName - Tool name used to resolve the action classification
+   * @param {object} output - Structured output payload returned by the handler
    * @returns {object} CallToolResult with both text content and structuredContent
    */
-  private structured<T extends Record<string, unknown>>(output: T): { content: { type: 'text'; text: string }[]; structuredContent: T } {
+  private structured<T extends Record<string, unknown>>(toolName: keyof typeof Mcp.toolActions, output: T): { content: { type: 'text'; text: string }[]; structuredContent: T & { action: typeof Mcp.toolActions[keyof typeof Mcp.toolActions] } } {
+    const payload = { action: Mcp.toolActions[toolName], ...output };
     return {
-      content: [{ type: 'text', text: JSON.stringify(output) }],
-      structuredContent: output
+      content: [{ type: 'text', text: JSON.stringify(payload) }],
+      structuredContent: payload
     };
   }
 

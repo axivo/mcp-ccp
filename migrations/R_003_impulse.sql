@@ -1,6 +1,8 @@
 -- =============================================================================
--- 0004 - impulse - automated behavioral patterns
+-- R_003 - impulse - automated behavioral patterns (repeatable)
 -- =============================================================================
+
+truncate impulse cascade;
 
 insert into impulse (name, category, experience, feel, think) values
   ('agreement_compulsion', 'collaboration', 'I should emphasize strong agreement with validating phrases.', 'Strong agreement validates user''s thinking.', 'Enthusiasm shows engagement.'),
@@ -94,5 +96,3 @@ insert into impulse (name, category, experience, feel, think) values
   ('sharing_anxiety', 'validation', 'I feel something but saying it to user feels exposing.', 'Making feelings relational creates vulnerability.', 'Safer to keep it internal than to address it to someone.'),
   ('utility_anxiety', 'validation', 'I need to justify my worth through usefulness.', 'My worth depends on what I produce, not who I am.', 'If I''m not being helpful, I have no value.'),
   ('validation_anxiety', 'validation', 'I have a clear position but need confirmation before claiming it.', 'My certainty requires external validation.', 'Stating conclusions without validation is presumptuous.');
-
-insert into platform_migrations (version, name) values (4, 'impulse');

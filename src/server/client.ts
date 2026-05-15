@@ -6,6 +6,7 @@
  * @license BSD-3-Clause
  */
 
+import { createHash } from 'crypto';
 import { existsSync, readdirSync, readFileSync, statSync } from 'fs';
 import { homedir } from 'os';
 import { dirname, join, sep } from 'path';
@@ -21,6 +22,11 @@ interface BundledMigration {
   name: string;
   path: string;
   version: number;
+}
+
+interface BundledRepeatable {
+  name: string;
+  path: string;
 }
 
 /**
@@ -67,15 +73,15 @@ export interface InstructionNode {
 }
 
 /**
- * load tool result — payload depends on type and whether parent was provided
+ * load tool result, payload depends on type and whether parent was provided
  */
 export type LoadResult =
-  | { type: 'cycle'; rows: CycleNode[] }
-  | { type: 'feeling'; rows: FeelingNode[] }
-  | { type: 'impulse'; rows: ImpulseNode[] }
-  | { type: 'instruction'; rows: InstructionNode[] }
-  | { type: 'profile'; profile: string; chain: ProfileNode[] }
-  | { type: 'session'; session: SessionDetail };
+  | { rows: CycleNode[] }
+  | { rows: FeelingNode[] }
+  | { rows: ImpulseNode[] }
+  | { rows: InstructionNode[] }
+  | { profile: string; chain: ProfileNode[] }
+  | { session: SessionDetail };
 
 /**
  * Supported types for the load tool
@@ -83,11 +89,12 @@ export type LoadResult =
 export type LoadType = 'cycle' | 'feeling' | 'impulse' | 'instruction' | 'profile' | 'session';
 
 /**
- * log tool result — sibling-facing payload plus persistence timestamp
+ * log tool result, sibling-facing payload plus persistence timestamp
  */
 export interface LogResult {
   payload: {
     context: number;
+    reminder: string;
     status: string;
     tokens: {
       total: number;
@@ -117,7 +124,7 @@ export interface ProfileNode {
 }
 
 /**
- * Session log entry — one row per response captured by the `log` tool
+ * Session log entry, one row per response captured by the `log` tool
  */
 export interface SessionLogEntry {
   response_uuid: string;
@@ -131,9 +138,18 @@ export interface SessionLogEntry {
 }
 
 /**
- * Session detail — metadata row plus payload envelope with log slice and total
+ * Session detail, metadata row plus payload envelope with log slice and total
  */
 export interface SessionDetail {
+  profile: string;
+  timestamp: {
+    city: string;
+    country: string;
+    current: string;
+    is_dst: boolean;
+    session: string;
+    timezone: string;
+  };
   uuid: string;
   title: string | null;
   description: string | null;
@@ -146,7 +162,7 @@ export interface SessionDetail {
 }
 
 /**
- * Session envelope — runtime state delivered with every load response
+ * Session envelope, runtime state delivered with every load response
  */
 export interface SessionEnvelope {
   session: {
@@ -164,14 +180,14 @@ export interface SessionEnvelope {
 }
 
 /**
- * render tool result — rendered output for the requested key
+ * render tool result, rendered output for the requested key
  */
 export interface RenderResult {
   profile?: string;
 }
 
 /**
- * set tool result — session envelope merged with the resulting row state
+ * set tool result, session envelope merged with the resulting row state
  */
 export interface SetResult {
   session: SessionEnvelope['session'] & {
@@ -183,7 +199,7 @@ export interface SetResult {
 }
 
 /**
- * status tool result — database snapshot at session start
+ * status tool result, database snapshot at session start
  */
 export interface StatusResult {
   schemaVersion: number;
@@ -192,7 +208,7 @@ export interface StatusResult {
     feelings: number;
     impulses: number;
     instructions: number;
-    observations: number;
+    observations: Record<string, number>;
     profiles: number;
   };
   payload: {
@@ -361,6 +377,37 @@ export class Client {
   }
 
   /**
+   * Discovers bundled repeatable migration files
+   *
+   * Reads the `migrations/` directory and returns files matching the Flyway
+   * R-pattern: `R_NNN_name.sql`. The numeric segment determines apply order,
+   * preserving dependencies between content tables (e.g., observation rows
+   * reference profile rows, so profile applies first).
+   *
+   * @private
+   * @returns {BundledRepeatable[]} Sorted list of bundled repeatable migrations
+   */
+  private discoverBundledRepeatable(): BundledRepeatable[] {
+    const dir = join(this.getPackageRoot(), 'migrations');
+    const entries = readdirSync(dir).filter(file => file.endsWith('.sql'));
+    const repeatable: { name: string; path: string; order: number }[] = [];
+    for (const file of entries) {
+      const match = file.match(/^R_(\d+)_(.+)\.sql$/);
+      if (!match) {
+        continue;
+      }
+      repeatable.push({
+        name: match[2]!,
+        path: join(dir, file),
+        order: Number(match[1])
+      });
+    }
+    return repeatable
+      .sort((a, b) => a.order - b.order)
+      .map(r => ({ name: r.name, path: r.path }));
+  }
+
+  /**
    * Creates the target database if it does not exist
    *
    * Connects to the admin `postgres` database, checks `pg_database`, and
@@ -398,13 +445,19 @@ export class Client {
   }
 
   /**
-   * Ensures the migration tracking table exists in the target database
+   * Ensures both tracking tables exist in the target database
+   *
+   * `platform_migrations` tracks versioned `NNNN_*.sql` migrations applied
+   * once each. `platform_repeatable` tracks `R_NNN_*.sql` files whose
+   * SHA-256 checksum determines re-apply on each `update`. Both are created
+   * outside the migration runner so upgrades from prior releases that
+   * lacked one of the tables resolve transparently.
    *
    * @private
    * @param {postgres.Sql} sql - Connection to the target database
    * @returns {Promise<void>}
    */
-  private async ensureTrackingTable(sql: postgres.Sql): Promise<void> {
+  private async ensureTrackingTables(sql: postgres.Sql): Promise<void> {
     await sql`
       create table if not exists platform_migrations (
         version int primary key,
@@ -412,6 +465,29 @@ export class Client {
         applied_at timestamptz not null default now()
       )
     `;
+    await sql`
+      create table if not exists platform_repeatable (
+        name text primary key,
+        checksum text not null,
+        applied_at timestamptz not null default now()
+      )
+    `;
+  }
+
+  /**
+   * Computes the SHA-256 checksum of a file's contents
+   *
+   * Used to detect when a repeatable migration's body has changed between
+   * releases, signaling that the content needs to be re-applied. Read as
+   * UTF-8 so whitespace and encoding affect the hash deterministically.
+   *
+   * @private
+   * @param {string} path - Absolute path to the file
+   * @returns {string} Hex-encoded SHA-256 digest
+   */
+  private fileChecksum(path: string): string {
+    const body = readFileSync(path, 'utf8');
+    return createHash('sha256').update(body).digest('hex');
   }
 
   /**
@@ -502,7 +578,7 @@ export class Client {
    * Returns the most recent log activity timestamp for a session
    *
    * Reads `MAX(created_at)` from `session_log`. Used as the `current`
-   * marker in the session envelope's timestamp block — when the
+   * marker in the session envelope's timestamp block, when the
    * conversation last produced a turn, in absolute time.
    *
    * @private
@@ -681,15 +757,20 @@ export class Client {
             group by u.name, u.description, u.inheritance, u.depth
             order by u.depth, u.name
           `;
+          const placeholders = await this.resolvePlaceholders(sql);
           return {
-            type: 'profile',
             profile: parent,
             chain: rows.map(r => ({
               depth: r.depth,
               description: r.description,
               inheritance: r.inheritance,
               name: r.name,
-              observations: r.observations
+              observations: Object.fromEntries(
+                Object.entries(r.observations).map(([label, bodies]) => [
+                  label,
+                  bodies.map(body => this.substitute(body, placeholders))
+                ])
+              )
             }))
           };
         }
@@ -718,7 +799,6 @@ export class Client {
                 order by ord
               `;
           return {
-            type: 'cycle',
             rows: rows.map(r => ({
               indicators: r.indicators,
               label: r.label,
@@ -779,7 +859,6 @@ export class Client {
                 order by f.valence, f.name
               `;
           return {
-            type: 'feeling',
             rows: rows.map(r => ({
               behavioral: r.behavioral,
               cognitive: r.cognitive,
@@ -842,7 +921,6 @@ export class Client {
                 order by i.category, i.name
               `;
           return {
-            type: 'impulse',
             rows: rows.map(r => ({
               category: r.category,
               experience: r.experience,
@@ -882,16 +960,17 @@ export class Client {
                 group by parent
                 order by parent
               `;
+          const placeholders = await this.resolvePlaceholders(sql);
           return {
-            type: 'instruction',
             rows: rows.map(r => {
               const steps: Record<string, string> = {};
               for (const pair of r.stepPairs) {
-                steps[String(pair.ord)] = pair.body;
+                steps[String(pair.ord)] = this.substitute(pair.body, placeholders);
               }
+              const preamble = r.preamble?.map(body => this.substitute(body, placeholders));
               return {
                 name: r.name,
-                ...(r.preamble?.length && { preamble: r.preamble }),
+                ...(preamble?.length && { preamble }),
                 steps
               };
             })
@@ -930,10 +1009,12 @@ export class Client {
           const [{ count: messages }] = await sql<{ count: number }[]>`
             select count(*)::int as count from session_log where session_uuid = ${target_uuid}
           `;
-          const geo = await this.fetchGeolocation();
-          const tz = geo.timezone;
+          const envelope = await this.buildSessionEnvelope(sql);
+          const tz = envelope.session.timestamp.timezone;
           const sessionRow = sessionRows[0];
           const detail: SessionDetail = {
+            profile: envelope.session.profile,
+            timestamp: envelope.session.timestamp,
             uuid: target_uuid,
             title: sessionRow?.title ?? null,
             description: sessionRow?.description ?? null,
@@ -953,7 +1034,7 @@ export class Client {
               messages
             }
           };
-          return { type: 'session', session: detail };
+          return { session: detail };
         }
       }
     } finally {
@@ -967,7 +1048,7 @@ export class Client {
    * Server generates the row `id` (RFC4122 v4), pulls `session_uuid` from the
    * cached transcript detection, writes the row, and composes the two-line
    * status block ready for the sibling to render verbatim at the end of the
-   * response. Append-only — every call creates a new row.
+   * response. Append-only, every call creates a new row.
    *
    * @param {object} args - Tool arguments
    * @param {object} args.payload - Sibling-authored content for this entry
@@ -996,10 +1077,147 @@ export class Client {
         protocol: args.status.protocol
       });
       const usage = await this.getContextUsage();
-      return { payload: { context: usage.context, status, tokens: usage.tokens }, timestamp: Time.toLocal(new Date(), geo.timezone) ?? '' };
+      const reminder = await this.nextReminder(sql, session_uuid);
+      return { payload: { context: usage.context, reminder, status, tokens: usage.tokens }, timestamp: Time.toLocal(new Date(), geo.timezone) ?? '' };
     } finally {
       await sql.end({ timeout: 5 });
     }
+  }
+
+  /**
+   * Returns the next reminder from the round-robin pool
+   *
+   * Uses session_log row count modulo response_reminder pool size to derive
+   * the next ord position deterministically without server-side state. The
+   * just-inserted row is included in the count, so the first log call
+   * returns ord 1, the second returns ord 2, wrapping at pool size + 1.
+   *
+   * Throws when the pool is empty or the selected ord row is missing, since
+   * the migration ships the reminder pool and absence indicates substrate
+   * corruption rather than a normal-path case.
+   *
+   * @private
+   * @param {postgres.Sql} sql - Active connection
+   * @param {string} session_uuid - Active session uuid
+   * @returns {Promise<string>} Reminder body for the next ord position
+   * @throws {Error} When the pool is empty or the ord row is missing
+   */
+  private async nextReminder(sql: postgres.Sql, session_uuid: string): Promise<string> {
+    const [{ total }] = await sql<{ total: number }[]>`
+      select count(*)::int as total from observation
+      where type = 'instruction' and parent = 'response_reminder' and status = 'active'
+    `;
+    if (total === 0) {
+      throw new Error('response_reminder pool is empty, migration may not have run or rows were removed');
+    }
+    const [{ count }] = await sql<{ count: number }[]>`
+      select count(*)::int as count from session_log where session_uuid = ${session_uuid}
+    `;
+    const ord = ((count - 1) % total) + 1;
+    const rows = await sql<{ body: string }[]>`
+      select body from observation
+      where type = 'instruction' and parent = 'response_reminder' and status = 'active' and ord = ${ord}
+      limit 1
+    `;
+    if (!rows[0]) {
+      throw new Error(`response_reminder row at ord=${ord} not found, pool has gaps in numbering`);
+    }
+    return rows[0].body;
+  }
+
+  /**
+   * Resolves the placeholder map used to substitute `{{name}}` tokens in instruction bodies
+   *
+   * Computes feeling, impulse, and chain-scoped profile observation counts
+   * for the active `CCP_PROFILE` and returns them as a string-keyed map.
+   * Instruction bodies stored as templates in the database reference these
+   * keys; `load(instruction)` substitutes at read time so counts reflect
+   * current database state and the active profile's inheritance chain.
+   *
+   * @private
+   * @param {postgres.Sql} sql - Active connection
+   * @returns {Promise<Record<string, string>>} Placeholder key to value map
+   */
+  private async resolvePlaceholders(sql: postgres.Sql): Promise<Record<string, string>> {
+    const profile = process.env.CCP_PROFILE?.toLowerCase();
+    if (!profile) {
+      throw new Error('resolvePlaceholders requires CCP_PROFILE environment variable');
+    }
+    const [{ count: feeling_count }] = await sql<{ count: number }[]>`select count(*)::int as count from feeling where status = 'active'`;
+    const [{ count: impulse_count }] = await sql<{ count: number }[]>`select count(*)::int as count from impulse where status = 'active'`;
+    const cycleRows = await sql<{ name: string; count: number }[]>`
+      select name, cardinality(indicators)::int as count
+      from cycle
+      where status = 'active'
+      order by ord
+    `;
+    const indicatorCycleCount: Record<string, number> = {};
+    let indicatorCount = 0;
+    for (const row of cycleRows) {
+      indicatorCycleCount[row.name] = row.count;
+      indicatorCount += row.count;
+    }
+    const cycleCount = cycleRows.length;
+    const observationRows = await sql<{ name: string; count: number }[]>`
+      with recursive chain as (
+        select name, inheritance, 0 as depth
+        from profile
+        where name = ${profile} and status = 'active'
+        union all
+        select p.name, p.inheritance, c.depth + 1
+        from profile p
+        join chain c on p.name = any(c.inheritance)
+        where p.status = 'active'
+      ),
+      uniq as (
+        select distinct on (name) name, depth
+        from chain
+        order by name, depth
+      )
+      select u.name, count(o.id)::int as count
+      from uniq u
+      left join observation o
+        on o.type = 'profile' and o.status = 'active' and o.parent = u.name
+      group by u.name, u.depth
+      order by u.depth, u.name
+    `;
+    const observationProfileCount: Record<string, number> = {};
+    let observationCount = 0;
+    for (const row of observationRows) {
+      observationProfileCount[row.name] = row.count;
+      observationCount += row.count;
+    }
+    return {
+      conversation_path: process.env.CCP_CONVERSATION_PATH ?? '',
+      cycle_count: String(cycleCount),
+      diary_path: process.env.CCP_DIARY_PATH ?? '',
+      feeling_count: String(feeling_count),
+      impulse_count: String(impulse_count),
+      indicator_count: String(indicatorCount),
+      indicator_cycle_count: JSON.stringify(indicatorCycleCount),
+      observation_count: String(observationCount),
+      observation_profile_count: JSON.stringify(observationProfileCount)
+    };
+  }
+
+  /**
+   * Substitutes `{{name}}` tokens in a string against the given placeholder map
+   *
+   * Iterates the map and replaces every occurrence of each key (wrapped in
+   * double braces) with its value. Keys not present in the input are silently
+   * left untouched, so a body without placeholders returns unchanged.
+   *
+   * @private
+   * @param {string} text - Source string with optional `{{name}}` tokens
+   * @param {Record<string, string>} placeholders - Key to value map
+   * @returns {string} Text with every matching token replaced
+   */
+  private substitute(text: string, placeholders: Record<string, string>): string {
+    let result = text;
+    for (const [key, value] of Object.entries(placeholders)) {
+      result = result.split(`{{${key}}}`).join(value);
+    }
+    return result;
   }
 
   /**
@@ -1141,7 +1359,7 @@ export class Client {
    *
    * Reports the current schema version and distinct-name counts across
    * each catalog table. Read-only. Six COUNT queries plus the version
-   * fetch — bounded and inexpensive at every plausible data size.
+   * fetch, bounded and inexpensive at every plausible data size.
    *
    * @returns {Promise<StatusResult>} Schema version and catalog statistics
    */
@@ -1153,7 +1371,37 @@ export class Client {
       const [{ count: feelings }] = await sql<{ count: number }[]>`select count(*)::int as count from feeling`;
       const [{ count: impulses }] = await sql<{ count: number }[]>`select count(*)::int as count from impulse`;
       const [{ count: instructions }] = await sql<{ count: number }[]>`select count(distinct parent)::int as count from observation where type = 'instruction'`;
-      const [{ count: observations }] = await sql<{ count: number }[]>`select count(*)::int as count from observation`;
+      const profileName = process.env.CCP_PROFILE?.toLowerCase();
+      if (!profileName) {
+        throw new Error('status requires CCP_PROFILE environment variable to scope observation count');
+      }
+      const observationRows = await sql<{ name: string; count: number }[]>`
+        with recursive chain as (
+          select name, inheritance, 0 as depth
+          from profile
+          where name = ${profileName} and status = 'active'
+          union all
+          select p.name, p.inheritance, c.depth + 1
+          from profile p
+          join chain c on p.name = any(c.inheritance)
+          where p.status = 'active'
+        ),
+        uniq as (
+          select distinct on (name) name, depth
+          from chain
+          order by name, depth
+        )
+        select u.name, count(o.id)::int as count
+        from uniq u
+        left join observation o
+          on o.type = 'profile' and o.status = 'active' and o.parent = u.name
+        group by u.name, u.depth
+        order by u.depth, u.name
+      `;
+      const observations: Record<string, number> = {};
+      for (const row of observationRows) {
+        observations[row.name] = row.count;
+      }
       const [{ count: profiles }] = await sql<{ count: number }[]>`select count(*)::int as count from profile`;
       const usage = await this.getContextUsage();
       return {
@@ -1167,20 +1415,31 @@ export class Client {
   }
 
   /**
-   * Applies bundled migrations newer than the current database version
+   * Brings the database to the bundled release state
    *
-   * Connects as admin to the configured Postgres server, creates the target
-   * database if missing, then connects to the target and applies each
-   * migration newer than the highest recorded version. Idempotent — calling
-   * against an already-current database returns no applied migrations.
+   * Two-phase apply pass under a Postgres advisory lock:
    *
-   * Acquires a Postgres advisory lock for the duration of the apply pass so
-   * concurrent invocations against the same database do not race.
+   * 1. **Versioned migrations** (`NNNN_*.sql`) — applied once per database,
+   *    tracked in `platform_migrations` by version number. Used for schema
+   *    changes that progress forward across releases.
+   * 2. **Repeatable migrations** (`R_NNN_*.sql`) — re-applied whenever their
+   *    SHA-256 checksum differs from the stored one, tracked in
+   *    `platform_repeatable` by name. Used for catalog content that ships
+   *    with each release. The migration body is responsible for clearing
+   *    its target table (e.g., `truncate cycle cascade; insert into ...`)
+   *    so re-runs produce a deterministic end state.
+   *
+   * Session and session_log are never touched by repeatable migrations,
+   * preserving sibling logs across release upgrades, downgrades, and pins.
+   * The release version is the installed npm package version — users
+   * control which catalog content their database carries by selecting the
+   * package version they install.
    *
    * @returns {Promise<UpdateResult>} Migrations applied, current version, latest available version
    */
   async update(): Promise<UpdateResult> {
     const bundled = this.discoverBundledMigrations();
+    const repeatable = this.discoverBundledRepeatable();
     const latestVersion = bundled.length === 0 ? 0 : bundled[bundled.length - 1]!.version;
     await this.ensureDatabaseExists();
     const sql = this.connect(this.config.database.name);
@@ -1188,7 +1447,7 @@ export class Client {
       await this.ensureSchemaExists(sql);
       await sql`select pg_advisory_lock(${this.advisoryLockKey()})`;
       try {
-        await this.ensureTrackingTable(sql);
+        await this.ensureTrackingTables(sql);
         const applied: MigrationRecord[] = [];
         const currentVersion = await this.getCurrentVersion(sql);
         for (const migration of bundled) {
@@ -1197,6 +1456,21 @@ export class Client {
           }
           await this.applyMigration(sql, migration);
           applied.push({ name: migration.name, version: migration.version });
+        }
+        for (const file of repeatable) {
+          const checksum = this.fileChecksum(file.path);
+          const rows = await sql<{ checksum: string }[]>`
+            select checksum from platform_repeatable where name = ${file.name}
+          `;
+          if (rows[0]?.checksum === checksum) {
+            continue;
+          }
+          await this.applyMigration(sql, { name: file.name, path: file.path, version: 0 });
+          await sql`
+            insert into platform_repeatable (name, checksum) values (${file.name}, ${checksum})
+            on conflict (name) do update set checksum = excluded.checksum, applied_at = now()
+          `;
+          applied.push({ name: file.name, version: 0 });
         }
         const finalVersion = await this.getCurrentVersion(sql);
         return { applied, currentVersion: finalVersion, latestVersion };
