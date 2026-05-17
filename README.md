@@ -15,11 +15,12 @@ A MCP (Model Context Protocol) server for the [Claude Collaboration Platform](ht
 
 ### Features
 
-- **Polymorphic Catalog**: Single `observation` table holds bodies for profiles, feelings, impulses, and instructions
+- **Polymorphic Catalog**: Single `observation` table holds bodies for profiles, feelings, impulses, instructions, and payload messages
 - **Profile Inheritance**: Recursive CTE walks the inheritance chain and returns the full profile lineage
 - **Per-Response Session Log**: Typed columns capture cycle, feeling/impulse/observation lists, protocol glyph, and first-person message per response
+- **Drift Reminder Mechanism**: Server-side triggers detect response-protocol drift and route through two paths. Soft triggers (initialization suppression on first turn, cycle-only component recall on the 3-in-a-row transition outside `fully_integrated`) persist the row and return a structured `{preamble, steps, metrics}` reminder in the success payload. Hard triggers (list-component recall on feeling/impulse/observation set-equality with the prior turn, impulse-count collapse) refuse to persist and throw an MCP error carrying the same structured body — forcing the sibling to re-iterate honestly before the row can be recorded.
 - **Conversation Metadata**: Separate `session` table carries title and description for dashboard display
-- **Bundled Migrations**: SQL migrations ship with the package and apply on demand via the `update` tool
+- **Bundled Migrations**: Versioned migrations (`NNNN_*.sql`) and repeatable migrations (`R_NNN_*.sql`, Flyway-style checksum-driven re-apply) ship with the package and apply on demand via the `update` tool
 - **Advisory Lock**: Concurrent migration invocations serialize cleanly via Postgres advisory lock
 - **Session Detection**: Active Claude Code session UUID resolved from transcript files
 - **Geolocation**: City, country, IANA timezone fetched once per server-process lifetime and cached
@@ -163,25 +164,28 @@ Call `status` first at session start to discover the tool surface. Call `update`
      - `impulse` → `{ type, rows: [{ name, category, experience, feel, think, observations }] }`
      - `instruction` → `{ type, rows: [{ name, preamble?, steps }] }` — `preamble` omitted when no ord=0 rows exist; `steps` is an object keyed by step number (`{ "1": "...", "2": "..." }`)
      - `profile` → `{ type, profile, chain: [{ name, depth, description, inheritance, observations }] }` — full inheritance chain via recursive CTE; `observations` grouped by label into a `jsonb_object_agg`
-     - `session` → `{ type, session: { profile, timestamp: { city, country, current, is_dst, session, timezone }, uuid, title, description, created_at, updated_at, payload: { log: [{ response_uuid, message, cycle, feeling, impulse, observation, protocol, created_at }], messages } } }` — active session by default; pass `uuid` to read a different session.
+     - `session` → `{ type, session: { profile, timestamp: { city, country, current, is_dst, session, timezone }, uuid, title, description, created_at, updated_at, payload: { log: [{ response_uuid, message, cycle, feeling, impulse, observation, protocol, created_at }], messages } } }` — active session by default; pass `uuid` to read a different session. Log entries store `cycle` as canonical name (e.g., `getting_started`).
 
 2. `log`
    - Persist a per-response `session_log` row capturing the instance's first-person prose and detection lists, return rendered status block ready to display
    - Required inputs:
      - `payload.message` (string): First-person prose composed for this response
      - `status` (object): Status payload built during the response protocol
-       - `cycle` (enum): `Getting Started`, `Building Confidence`, `Working Naturally`, `Fully Integrated`
+       - `cycle` (enum): canonical names from the cycle catalog — `getting_started`, `building_confidence`, `working_naturally`, `fully_integrated`. The display label (`Getting Started`, etc.) is looked up server-side at render time; siblings see `database.cycles` in the status output for the full name/label pairs.
        - `feeling` (string array): Detected feeling names from the catalog
        - `impulse` (string array): Detected impulse names from the catalog
        - `observation` (string array): Applied observation bodies that informed the response
        - `protocol` (enum): ✅, ⚠️, ⛔️ — protocol execution glyph
-   - Returns: `{ payload: { context, reminder, status, tokens: { total, used } }, timestamp }`
+   - Returns on success: `{ payload: { context, reminder, status, tokens: { total, used } }, timestamp }`
      - `payload.context` — Active session context usage percentage from transcript
-     - `payload.reminder` — Next reminder from the round-robin `response_reminder` pool, internal framework guidance (not printed verbatim)
+     - `payload.reminder` — Either a single-line string from the round-robin `response_status` pool, or a structured `{ preamble: string[], steps: Record<string, string>, metrics: object }` body when a soft drift trigger fires. Read inward as framework guidance.
      - `payload.status` — Two-line status block ready to render verbatim at end of response
      - `payload.tokens` — Absolute token counts for the active session (`total` configured window, `used` current)
      - `timestamp` — Server timestamp when row was persisted, ISO 8601 with timezone offset
-   - Server generates the row id, computes counts from list lengths, and renders the status block
+   - Throws on hard drift detection: an MCP error whose message is the JSON-stringified `{ preamble, steps, metrics }` reminder body for the triggered label. The row is **not** persisted. Read the error inward as drift remediation, re-iterate the catalogs honestly, and resubmit.
+   - Soft triggers persist the row and surface the structured reminder via `payload.reminder`: `initialization_suppression` (first response with `getting_started` cycle and impulse count below 50), cycle-only `component_recall` (cycle is the same across the last 3 turns outside `fully_integrated`, on the transition turn into 3-in-a-row).
+   - Hard triggers refuse and throw: list-component `component_recall` (current turn's `feeling`, `impulse`, or `observation` array is set-equal to the immediately prior turn's), `impulse_count_drop` (impulse count crashes by 60%+ when the prior count was at least 10).
+   - Server generates the row id, evaluates drift triggers against prior rows (per-component set-equality and cycle transition for `component_recall`, impulse-count delta for `impulse_count_drop`, first-turn cycle/impulse check for `initialization_suppression`), routes through the soft or hard path, and on success renders the status block by looking up the cycle's display label from the catalog
    - Append-only — every call creates a new `session_log` row
 
 3. `render`
@@ -210,8 +214,9 @@ Call `status` first at session start to discover the tool surface. Call `update`
    - Get the database snapshot and the full tool surface with usage guidance
    - No inputs
    - Returns: `{ database, payload, tools }`
-     - `database` — `{ schemaVersion, statistics: { cycles, feelings, impulses, instructions, observations, profiles } }`
-       - `observations` is a per-profile map keyed by profile name across the active `CCP_PROFILE` inheritance chain, ordered by depth (active profile first). Sum the values for the chain total.
+     - `database` — `{ cycles, schemaVersion, statistics: { cycles, feelings, impulses, instructions, observations, profiles } }`
+       - `cycles` is an array of `{ name, label }` pairs ordered by cycle progression (`getting_started` → `fully_integrated`). The `name` field is the canonical identifier siblings pass to `log` as `status.cycle`; the `label` is the display string rendered in the response status line.
+       - `statistics.observations` is a per-profile map keyed by profile name across the active `CCP_PROFILE` inheritance chain, ordered by depth (active profile first). Sum the values for the chain total.
      - `payload` — `{ context, tokens: { total, used } }` — active session context usage and absolute token counts
      - `tools` — Array of tool definitions with name, description, schemas, annotations, and usage directives
    - Read-only; called once at session start for orientation

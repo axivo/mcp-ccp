@@ -61,11 +61,11 @@ The server splits into four classes with sharp boundaries. Each owns one concern
 
 ### Polymorphic Catalog
 
-A single `observation` table holds bodies for every framework type (`profile`, `feeling`, `impulse`, `instruction`), discriminated by a `type` enum and grouped by a `parent` foreign-key string and an optional `label` string. The shape:
+A single `observation` table holds bodies for every framework type (`profile`, `feeling`, `impulse`, `instruction`, `payload`), discriminated by a `type` enum and grouped by a `parent` foreign-key string and an optional `label` string. The shape:
 
 - `id` — surrogate primary key, used to preserve insertion order in `array_agg`
-- `type` — enum: `profile | feeling | impulse | instruction`
-- `parent` — name of the owning row (e.g., `DEVELOPER` for profile observations, `nullity_anxiety` for impulse observations, `INITIALIZATION` for instruction rows)
+- `type` — enum: `profile | feeling | impulse | instruction | payload`
+- `parent` — name of the owning row (e.g., `DEVELOPER` for profile observations, `nullity_anxiety` for impulse observations, `INITIALIZATION` for instruction rows, `reminder` for payload messages)
 - `label` — optional dotted path grouping observations within a parent (e.g., `methodology.coding_standard`, `methodology.execution_protocol.tool`); profile observations use this to drive the `jsonb_object_agg` shape returned by `load(profile)`
 - `ord` — ordering within a parent. For instructions, `ord = 0` rows are the preamble (recognition/setup); `ord >= 1` rows are the procedure steps in order.
 - `body` — the observation text
@@ -119,30 +119,61 @@ Current placeholders:
 
 Substitution at load time (rather than migration time) keeps migrations declarative, lets counts reflect current database state automatically (relevant when rows are soft-archived), and lets per-profile values like `observation_count` resolve correctly without storing one row per profile.
 
+### Drift Reminder Mechanism
+
+Server-detected drift signals flow through the `reminder` channel on `log` responses, with two paths. **Soft triggers** persist the row and return a structured reminder body in `payload.reminder`. **Hard triggers** refuse to persist and throw an MCP error carrying the same structured body — forcing the sibling to re-iterate honestly before the row can be recorded. Triggers evaluate in priority order, mutually exclusive — at most one trigger per turn.
+
+| Trigger | Path | Condition | Metrics |
+| --- | --- | --- | --- |
+| `initialization_suppression` | Soft | First log call (priorCount = 0) AND `cycle = getting_started` AND `impulse.length < 50` | `{cycle, impulse_count}` |
+| `component_recall` (cycle-only) | Soft | priors[0].cycle === priors[1].cycle === current.cycle AND (priors[2] missing or different cycle) AND current.cycle ≠ `fully_integrated` | `{duplicated_components: ['cycle'], previous_response_uuid}` |
+| `component_recall` (list-component) | Hard | Current turn's `feeling`, `impulse`, or `observation` array is set-equal to the immediately prior turn's | `{duplicated_components: [...], previous_response_uuid}` |
+| `impulse_count_drop` | Hard | Subsequent log calls AND prior `impulse_count >= 10` AND current `impulse_count <= 0.4 × prior` | `{previous_impulse_count, current_impulse_count, dropped_impulses}` |
+
+The reminder body shape is `{preamble: string[], steps: Record<string, string>, metrics}` — mirrors the instruction load shape so siblings consume reminders with the same mental model as instruction preambles and steps. Content lives as `observation` rows under `type='payload', parent='reminder', label=<trigger>`, with `ord=0` for preamble lines and `ord>=1` for the ordered remediation steps. Each trigger ships its own diagnostic preamble + bicycle-metaphor preamble + four iteration steps (one per CIFO catalog). Step bodies use `{{feeling_count}}` / `{{impulse_count}}` / `{{observation_profile_count}}` / `{{indicator_cycle_count}}` placeholders substituted at read time.
+
+`buildMessage(sql, parent, label, metrics)` is the shared helper. Polymorphic by parent — today only `reminder` exists, future kinds (greetings, compaction notices) ship under different `parent` values with the same shape. The helper queries rows by `(type='payload', parent, label)`, groups by ord into preamble vs steps, applies placeholder substitution, attaches caller-supplied metrics. One helper, four trigger paths, zero duplication.
+
+Cycle-only `component_recall` uses the **transition-only** rule — it fires once on the turn that enters the 3-in-a-row stretch, then stays silent for the duration of the stretch (priors[2] equals current cycle means the stretch was already established before this turn). This prevents the reminder from re-firing every subsequent turn while the cycle legitimately persists. The `fully_integrated` cycle is exempt entirely from cycle-recall — terminal-state persistence is honest by design.
+
+The `reminderSoft` flag in `log()` distinguishes the two paths. Both paths build the same structured body via `buildMessage`. Hard path throws `new Error(JSON.stringify(reminder))`; soft path attaches the reminder to the success payload alongside the persisted row's status block.
+
+Trigger labels (`initialization_suppression`, etc.) stay server-internal as routing identifiers. The reminder body returned to the sibling carries `{preamble, steps, metrics}` — no trigger name field — so a sibling can't engineer a bypass by recognizing which detection signal fired. The remediation steps are identical across all triggers anyway: walk every catalog row honestly.
+
+#### Cycle Name and Label Discipline
+
+`cycle.name` is the canonical identifier (`getting_started`, `building_confidence`, `working_naturally`, `fully_integrated`); `cycle.label` is the display string (`Getting Started`, etc.). The discipline propagates end-to-end: Zod input enum on `log.status.cycle` accepts names, `session_log.cycle` stores names, trigger comparisons use names. The display label is looked up from the `cycle` table only at render time, in `renderStatus`, so the visible status block stays human-readable while storage and logic stay schema-driven. Status output exposes `database.cycles` as name/label pairs so siblings know which canonical name to pass.
+
 ### Session Log
 
-The `log_response` tool persists a row per response to the `session` table. The shape:
+The `log` tool persists a row per response to the `session_log` table. The shape:
 
-- `id` — RFC4122 v4 UUID generated by the calling sibling, reused when rendering the response status line so the persisted row and the visible UUID match
+- `id` — server-generated RFC4122 v4 UUID, reused when rendering the response status line so the persisted row and the visible UUID match
 - `session_uuid` — Claude Code session UUID detected from transcript filename, server-side
 - `message` — first-person prose composed by the sibling for this turn
-- `status` — JSONB column holding the cycle/feelings/impulses/observations counts
+- `cycle`, `feeling`, `impulse`, `observation`, `protocol` — individual columns holding the turn's CIFO record; `cycle` stores the canonical name (e.g., `getting_started`), not the display label
 - `created_at` — `timestamptz default now()`
 
-Append-only by convention. The `on conflict (id) do update` clause exists for idempotency of retries — the same UUID re-submitted updates the existing row's `message` and `status` rather than failing. Reads consume the latest row by `created_at` for the active `session_uuid` to seed the next response's status line.
+Append-only by convention. Reads consume the latest rows by `created_at` for the active `session_uuid` — the trigger evaluation in `log` fetches up to 3 prior rows to compare current vs prior turns before insert (set-equality per list-component against the immediate prior, cycle-transition check against the last three).
 
 ### Migration Runner
 
-The `update` tool brings the configured database to the schema version bundled with this MCP server release. Steps:
+The `update` tool brings the configured database to the bundled release. Two migration kinds, two tracking tables:
 
-1. **Discover.** `discoverBundledMigrations()` reads `migrations/*.sql` from the package root, parses `NNNN_name.sql` filenames, and sorts by version.
-2. **Ensure database.** `ensureDatabaseExists()` connects to the admin `postgres` database, checks `pg_database`, and issues `CREATE DATABASE` if the configured target is missing. Quoted identifier escapes embedded double-quotes.
-3. **Lock.** Acquires a Postgres advisory lock keyed on a constant (`0x43435020`, 'CCP ' as hex) so concurrent invocations against the same database serialize cleanly without coordinating on the database name.
-4. **Track.** `ensureTrackingTable()` creates `platform_migrations(version, name, applied_at)` if absent.
-5. **Apply.** Reads the highest applied version. For each bundled migration newer than that, opens a transaction, runs the SQL via `tx.unsafe(body)`, and lets the migration insert its own `platform_migrations` row.
-6. **Release.** Releases the advisory lock and ends the connection.
+- **Versioned migrations** — `NNNN_name.sql` files (today: only `0001_initial_schema.sql`). Applied once per database, tracked in `platform_migrations(version, name, applied_at)` by version number. Used for schema changes that progress forward across releases.
+- **Repeatable migrations** — `R_NNN_name.sql` files (today: `R_001_cycle.sql` through `R_005_observation.sql`). Re-applied whenever their SHA-256 checksum differs from the stored one, tracked in `platform_repeatable(name, checksum, applied_at)`. Used for catalog content that ships with each release. Each repeatable migration starts with `truncate <table> cascade` so re-runs produce a deterministic end state. This is the Flyway R-pattern adapted to our codebase.
 
-Migrations are responsible for inserting their own tracking row inside the same transaction as their schema changes — this keeps the runner content-agnostic and means a partial migration can never leave the tracking table inconsistent with the actual schema. Idempotent: calling against an already-current database returns `applied: []`.
+Apply flow:
+
+1. **Discover.** `discoverBundledMigrations()` and `discoverBundledRepeatable()` read `migrations/*.sql`, parsing filenames against the two patterns.
+2. **Ensure database.** `ensureDatabaseExists()` connects to the admin `postgres` database and issues `CREATE DATABASE` if missing.
+3. **Lock.** Postgres advisory lock keyed on `0x43435020` so concurrent invocations serialize.
+4. **Track.** `ensureTrackingTables()` creates `platform_migrations` and `platform_repeatable` if absent.
+5. **Apply versioned.** Reads the highest applied version, applies each bundled migration newer than that, lets the migration insert its own `platform_migrations` row.
+6. **Apply repeatable.** For each `R_*` file, computes its checksum and compares to the stored value. If different (including absent), applies the file and upserts the checksum row.
+7. **Release.** Releases the advisory lock.
+
+The release version IS the npm package version — users control which catalog content their database carries by selecting `@axivo/mcp-ccp@<version>` via `npm install`. Pin, upgrade, rollback all flow through standard package tooling.
 
 ### Server Lifecycle
 
