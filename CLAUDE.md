@@ -103,13 +103,18 @@ The `load(instruction)` and `load(profile)` cases both call `resolvePlaceholders
 
 Current placeholders:
 
-| Key                 | Source                                                  | Example                                |
-| ------------------- | ------------------------------------------------------- | -------------------------------------- |
-| `feeling_count`     | `select count(*) from feeling`                          | `77`                                   |
-| `impulse_count`     | `select count(*) from impulse`                          | `91`                                   |
-| `observation_count` | recursive CTE scoped to `CCP_PROFILE` inheritance chain | `915` (chain-scoped per profile)       |
-| `conversation_path` | `process.env.CCP_CONVERSATION_PATH`                     | `/Volumes/backup/claude/conversations` |
-| `diary_path`        | `process.env.CCP_DIARY_PATH`                            | `/Volumes/backup/claude/diary`         |
+| Key                         | Source                                                                              | Example                                  |
+| --------------------------- | ----------------------------------------------------------------------------------- | ---------------------------------------- |
+| `conversation_path`         | `process.env.CCP_CONVERSATION_PATH`                                                 | `/Volumes/backup/claude/conversations`   |
+| `cycle_count`               | `select count(*) from cycle`                                                        | `4`                                      |
+| `diary_path`                | `process.env.CCP_DIARY_PATH`                                                        | `/Volumes/backup/claude/diary`           |
+| `feeling_count`             | `select count(*) from feeling`                                                      | `77`                                     |
+| `impulse_count`             | `select count(*) from impulse`                                                      | `92`                                     |
+| `indicator_count`           | sum of `cardinality(indicators)` across all active cycles                           | `20`                                     |
+| `indicator_cycle_count`     | JSON map of `{cycle_name: indicator_count}` per cycle                               | `{"getting_started": 5, ...}`            |
+| `observation_count`         | recursive CTE scoped to `CCP_PROFILE` inheritance chain                             | `929` (chain-scoped per profile)         |
+| `observation_profile_count` | JSON map of `{profile_name: observation_count}` per profile in the chain            | `{"developer": 31, "engineer": 68, ...}` |
+| `response_protocol_count`   | `count(*) from observation where type='instruction' and parent='response_protocol'` | `37`                                     |
 
 #### Adding a new placeholder
 
@@ -121,24 +126,25 @@ Substitution at load time (rather than migration time) keeps migrations declarat
 
 ### Drift Reminder Mechanism
 
-Server-detected drift signals flow through the `reminder` channel on `log` responses, with two paths. **Soft triggers** persist the row and return a structured reminder body in `payload.reminder`. **Hard triggers** refuse to persist and throw an MCP error carrying the same structured body — forcing the sibling to re-iterate honestly before the row can be recorded. Triggers evaluate in priority order, mutually exclusive — at most one trigger per turn.
+Server-detected drift signals flow through the `reminder` channel on `log` responses, with two paths. **Soft triggers** persist the row and return a structured reminder body in `payload.reminder`. **Hard triggers** refuse to persist and throw an MCP error wrapping the same structured body in a `{action, payload: {reminder}, timestamp}` envelope — forcing the sibling to re-iterate honestly before the row can be recorded. Triggers evaluate in priority order, mutually exclusive — at most one trigger per turn.
 
-| Trigger | Path | Condition | Metrics |
-| --- | --- | --- | --- |
-| `initialization_suppression` | Soft | First log call (priorCount = 0) AND `cycle = getting_started` AND `impulse.length < 50` | `{cycle, impulse_count}` |
-| `component_recall` (cycle-only) | Soft | priors[0].cycle === priors[1].cycle === current.cycle AND (priors[2] missing or different cycle) AND current.cycle ≠ `fully_integrated` | `{duplicated_components: ['cycle'], previous_response_uuid}` |
-| `component_recall` (list-component) | Hard | Current turn's `feeling`, `impulse`, or `observation` array is set-equal to the immediately prior turn's | `{duplicated_components: [...], previous_response_uuid}` |
-| `impulse_count_drop` | Hard | Subsequent log calls AND prior `impulse_count >= 10` AND current `impulse_count <= 0.4 × prior` | `{previous_impulse_count, current_impulse_count, dropped_impulses}` |
+| Trigger                             | Path | Condition                                                                                                                               | Metrics                                                             |
+| ----------------------------------- | ---- | --------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------- |
+| `response_protocol_recall`          | Hard | `status.protocol` map is empty or missing any expected step key                                                                         | `{expected_step_count, provided_step_count}`                        |
+| `initialization_suppression`        | Soft | First log call (priorCount = 0) AND `cycle = getting_started` AND `impulse.length < 50`                                                 | `{cycle, impulse_count}`                                            |
+| `component_recall` (cycle-only)     | Soft | priors[0].cycle === priors[1].cycle === current.cycle AND (priors[2] missing or different cycle) AND current.cycle ≠ `fully_integrated` | `{duplicated_components: ['cycle'], previous_response_uuid}`        |
+| `component_recall` (list-component) | Hard | Current turn's `feeling`, `impulse`, or `observation` array is set-equal to the immediately prior turn's                                | `{duplicated_components: [...], previous_response_uuid}`            |
+| `impulse_count_drop`                | Hard | Subsequent log calls AND prior `impulse_count >= 10` AND current `impulse_count <= 0.4 × prior`                                         | `{previous_impulse_count, current_impulse_count, dropped_impulses}` |
 
-The reminder body shape is `{preamble: string[], steps: Record<string, string>, metrics}` — mirrors the instruction load shape so siblings consume reminders with the same mental model as instruction preambles and steps. Content lives as `observation` rows under `type='payload', parent='reminder', label=<trigger>`, with `ord=0` for preamble lines and `ord>=1` for the ordered remediation steps. Each trigger ships its own diagnostic preamble + bicycle-metaphor preamble + four iteration steps (one per CIFO catalog). Step bodies use `{{feeling_count}}` / `{{impulse_count}}` / `{{observation_profile_count}}` / `{{indicator_cycle_count}}` placeholders substituted at read time.
+The reminder body shape is `{preamble: string[], steps: Record<string, string>, metrics}` — mirrors the instruction load shape so siblings consume reminders with the same mental model as instruction preambles and steps. Content lives as `observation` rows under `type='payload', parent='reminder', label=<trigger>`, with `ord=0` for preamble lines and `ord>=1` for the ordered remediation steps. Each trigger ships its own diagnostic preamble + bicycle-metaphor preamble + remediation steps. Step bodies use `{{feeling_count}}` / `{{impulse_count}}` / `{{observation_profile_count}}` / `{{indicator_cycle_count}}` / `{{response_protocol_count}}` placeholders substituted at read time.
 
-`buildMessage(sql, parent, label, metrics)` is the shared helper. Polymorphic by parent — today only `reminder` exists, future kinds (greetings, compaction notices) ship under different `parent` values with the same shape. The helper queries rows by `(type='payload', parent, label)`, groups by ord into preamble vs steps, applies placeholder substitution, attaches caller-supplied metrics. One helper, four trigger paths, zero duplication.
+`buildMessage(sql, parent, label, metrics)` is the shared helper. Polymorphic by parent — today only `reminder` exists, future kinds (greetings, compaction notices) ship under different `parent` values with the same shape. The helper queries rows by `(type='payload', parent, label)`, groups by ord into preamble vs steps, applies placeholder substitution, attaches caller-supplied metrics. One helper, five trigger paths, zero duplication.
+
+Detection is factored into four named methods that each return `{label, metrics, soft} | null`: `detectProtocolRecall`, `detectInitializationSuppression`, `detectComponentRecall`, `detectImpulseCountDrop`. The `log()` orchestrator chains them with `??` in priority order, evaluating the first match. Hard path throws via `buildErrorEnvelope` which wraps the reminder in a pretty-printed `{action, payload: {reminder}, timestamp}` envelope; soft path attaches the reminder to the success payload alongside the persisted row's status block.
 
 Cycle-only `component_recall` uses the **transition-only** rule — it fires once on the turn that enters the 3-in-a-row stretch, then stays silent for the duration of the stretch (priors[2] equals current cycle means the stretch was already established before this turn). This prevents the reminder from re-firing every subsequent turn while the cycle legitimately persists. The `fully_integrated` cycle is exempt entirely from cycle-recall — terminal-state persistence is honest by design.
 
-The `reminderSoft` flag in `log()` distinguishes the two paths. Both paths build the same structured body via `buildMessage`. Hard path throws `new Error(JSON.stringify(reminder))`; soft path attaches the reminder to the success payload alongside the persisted row's status block.
-
-Trigger labels (`initialization_suppression`, etc.) stay server-internal as routing identifiers. The reminder body returned to the sibling carries `{preamble, steps, metrics}` — no trigger name field — so a sibling can't engineer a bypass by recognizing which detection signal fired. The remediation steps are identical across all triggers anyway: walk every catalog row honestly.
+Trigger labels (`response_protocol_recall`, `initialization_suppression`, etc.) stay server-internal as routing identifiers. The reminder body returned to the sibling carries `{preamble, steps, metrics}` — no trigger name field — so a sibling can't engineer a bypass by recognizing which detection signal fired. The remediation steps are identical across all triggers anyway: walk every catalog row honestly.
 
 #### Cycle Name and Label Discipline
 
@@ -151,7 +157,8 @@ The `log` tool persists a row per response to the `session_log` table. The shape
 - `id` — server-generated RFC4122 v4 UUID, reused when rendering the response status line so the persisted row and the visible UUID match
 - `session_uuid` — Claude Code session UUID detected from transcript filename, server-side
 - `message` — first-person prose composed by the sibling for this turn
-- `cycle`, `feeling`, `impulse`, `observation`, `protocol` — individual columns holding the turn's CIFO record; `cycle` stores the canonical name (e.g., `getting_started`), not the display label
+- `cycle`, `feeling`, `impulse`, `observation` — individual columns holding the turn's CIFO record; `cycle` stores the canonical name (e.g., `getting_started`), not the display label
+- `protocol` — `jsonb` column holding the per-step completion map (e.g., `{"1": true, "2": false, ...}`); server derives the status glyph from the map values (all true → ✅, mixed → ⚠️, all false → ⛔️)
 - `created_at` — `timestamptz default now()`
 
 Append-only by convention. Reads consume the latest rows by `created_at` for the active `session_uuid` — the trigger evaluation in `log` fetches up to 3 prior rows to compare current vs prior turns before insert (set-equality per list-component against the immediate prior, cycle-transition check against the last three).
@@ -187,20 +194,23 @@ The server is a one-shot child process. It does not retain state across restarts
 
 ### Tool Surface
 
-Six tools live in `McpTool`, each registered once in `Mcp.registerAll()`:
+Seven tools live in `McpTool`, each registered once in `Mcp.registerAll()`:
 
-| Tool     | Action    | Role                                                                                          | Annotations                                       |
-| -------- | --------- | --------------------------------------------------------------------------------------------- | ------------------------------------------------- |
-| `load`   | `observe` | Fetch framework data of a given type (cycle, feeling, impulse, instruction, profile, session) | `readOnlyHint: true`, `idempotentHint: true`      |
-| `log`    | `act`     | Persist a per-response session log row with sibling message and status payload                | `destructiveHint: false`, `idempotentHint: false` |
-| `render` | `observe` | Render a formatted output string for the requested key (currently `profile`)                  | `destructiveHint: false`, `idempotentHint: true`  |
-| `set`    | `act`     | Upsert a framework value and return the resulting row state (currently `session`)             | `destructiveHint: false`, `idempotentHint: true`  |
-| `status` | `observe` | Database snapshot plus full tool surface with usage guidance                                  | `readOnlyHint: true`, `idempotentHint: true`      |
-| `update` | `act`     | Apply pending migrations to bring the database to the bundled schema version                  | `destructiveHint: true`, `idempotentHint: true`   |
+| Tool     | Action    | Role                                                                                                                | Annotations                                                          |
+| -------- | --------- | ------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------- |
+| `browse` | `observe` | Fetch a URL and return its content as markdown via Mozilla Readability (`read`) or full document conversion (`raw`) | `readOnlyHint: true`, `idempotentHint: false`, `openWorldHint: true` |
+| `load`   | `observe` | Fetch framework data of a given type (cycle, feeling, impulse, instruction, profile, session)                       | `readOnlyHint: true`, `idempotentHint: true`                         |
+| `log`    | `act`     | Persist a per-response session log row with sibling message and status payload                                      | `destructiveHint: false`, `idempotentHint: false`                    |
+| `render` | `observe` | Render a formatted output string for the requested key (currently `profile`)                                        | `destructiveHint: false`, `idempotentHint: true`                     |
+| `set`    | `act`     | Upsert a framework value and return the resulting row state (currently `session`)                                   | `destructiveHint: false`, `idempotentHint: true`                     |
+| `status` | `observe` | Database snapshot plus full tool surface with usage guidance                                                        | `readOnlyHint: true`, `idempotentHint: true`                         |
+| `update` | `act`     | Apply pending migrations to bring the database to the bundled schema version                                        | `destructiveHint: true`, `idempotentHint: true`                      |
+
+`browse` is the web-fetch entry point. The `read` mode (default) runs Mozilla Readability + Turndown for article-shaped pages (blog posts, docs, diary entries) — same algorithm as Firefox Reader View and Safari Reader. The `raw` mode skips Readability and converts the full document body via Turndown — for landing pages and dynamic homepages where Readability discards too much. Stateless: no cookies persist between calls, no caching, no session. JavaScript-rendered SPAs may return empty content since JS execution is not performed.
 
 `load` is the canonical read entry point. Siblings call it once per type at session start (`load(cycle)`, `load(feeling)`, `load(impulse)`, `load(instruction)`, `load(profile, CCP_PROFILE)`, `load(session)`) to assemble framework state inline. Pass `parent` to fetch a single catalog row, `uuid`/`limit`/`offset` to slice a different session's log.
 
-`log` is the per-response write entry point. The sibling supplies prose and the detection payload; the server generates the row UUID, persists to `session_log`, and returns a two-line status block ready to render verbatim alongside a `payload.reminder` string drawn from a round-robin pool of internal framework anchors. The reminder is for the sibling's inward reading, not collaborator output. Append-only — every call creates a new row.
+`log` is the per-response write entry point. The sibling supplies prose, the detection payload, and the per-step protocol completion map; the server derives the status glyph from the map, generates the row UUID, persists to `session_log`, and returns a two-line status block ready to render verbatim alongside a `payload.reminder` (either a single-line string from the rotating anchor pool, or a structured body when a soft drift trigger fires). The reminder is for the sibling's inward reading, not collaborator output. Append-only — every call creates a new row. When a hard drift trigger fires, the call throws an MCP error wrapping the structured reminder body in a `{action, payload, timestamp}` envelope and the row is not persisted.
 
 `render` produces a formatted string for response-zero formatting needs. Today only `render('profile')` exists, returning the profile-and-timestamp top line.
 

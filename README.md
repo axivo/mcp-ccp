@@ -17,8 +17,9 @@ A MCP (Model Context Protocol) server for the [Claude Collaboration Platform](ht
 
 - **Polymorphic Catalog**: Single `observation` table holds bodies for profiles, feelings, impulses, instructions, and payload messages
 - **Profile Inheritance**: Recursive CTE walks the inheritance chain and returns the full profile lineage
-- **Per-Response Session Log**: Typed columns capture cycle, feeling/impulse/observation lists, protocol glyph, and first-person message per response
-- **Drift Reminder Mechanism**: Server-side triggers detect response-protocol drift and route through two paths. Soft triggers (initialization suppression on first turn, cycle-only component recall on the 3-in-a-row transition outside `fully_integrated`) persist the row and return a structured `{preamble, steps, metrics}` reminder in the success payload. Hard triggers (list-component recall on feeling/impulse/observation set-equality with the prior turn, impulse-count collapse) refuse to persist and throw an MCP error carrying the same structured body — forcing the sibling to re-iterate honestly before the row can be recorded.
+- **Per-Response Session Log**: Typed columns capture cycle, feeling/impulse/observation lists, per-step protocol completion map, and first-person message per response
+- **Drift Reminder Mechanism**: Server-side triggers detect response-protocol drift and route through two paths. Soft triggers (initialization suppression on first turn, cycle-only component recall on the 3-in-a-row transition outside `fully_integrated`) persist the row and return a structured `{preamble, steps, metrics}` reminder in the success payload. Hard triggers (protocol-map empty or incomplete, list-component recall on feeling/impulse/observation set-equality with the prior turn, impulse-count collapse) refuse to persist and throw an MCP error carrying the same structured body — forcing the sibling to re-iterate honestly before the row can be recorded.
+- **Web Browsing**: The `browse` tool fetches a URL and returns its content as markdown via Mozilla Readability (article-shaped pages, default `read` mode) or full document conversion (landing pages, `raw` mode).
 - **Conversation Metadata**: Separate `session` table carries title and description for dashboard display
 - **Bundled Migrations**: Versioned migrations (`NNNN_*.sql`) and repeatable migrations (`R_NNN_*.sql`, Flyway-style checksum-driven re-apply) ship with the package and apply on demand via the `update` tool
 - **Advisory Lock**: Concurrent migration invocations serialize cleanly via Postgres advisory lock
@@ -147,9 +148,25 @@ All fields optional with sensible defaults:
 
 ### MCP Tools
 
-Call `status` first at session start to discover the tool surface. Call `update` on a fresh database to apply all bundled migrations. Call `load` once per type to assemble framework state. Call `log` once per response to persist the instance's message and status payload. Call `render` for response-zero formatting needs. Call `set` to update conversation metadata for dashboard display.
+Call `status` first at session start to discover the tool surface. Call `update` on a fresh database to apply all bundled migrations. Call `browse` to fetch and read a web page as markdown. Call `load` once per type to assemble framework state. Call `log` once per response to persist the instance's message and status payload. Call `render` for response-zero formatting needs. Call `set` to update conversation metadata for dashboard display.
 
-1. `load`
+1. `browse`
+   - Fetch a URL and return its content as markdown
+   - Required inputs:
+     - `url` (string): The page URL to browse, including scheme
+   - Optional inputs:
+     - `mode` (string: `raw`, `read`): Extraction mode (default `read`). `read` applies Mozilla Readability for article-shaped pages; `raw` converts the full document body to markdown for landing pages and dynamic homepages.
+     - `timeout` (integer): Request timeout in milliseconds (default 10000)
+   - Returns: `{ action, byline, content, excerpt, fetchedAt, language, length, publishedAt, title, url }`
+     - `content` — Extracted main content as markdown
+     - `byline`, `excerpt`, `language`, `publishedAt`, `title` — Page metadata when detected, otherwise null
+     - `fetchedAt` — ISO 8601 timestamp of the fetch
+     - `length` — Character count of the markdown content
+     - `url` — Resolved URL after redirects
+   - Stateless — no cookies persist between calls, no caching, no session
+   - JavaScript-rendered pages may return empty content (JS execution is not performed)
+
+2. `load`
    - Load framework data of the requested type
    - Required inputs:
      - `type` (string: `cycle`, `feeling`, `impulse`, `instruction`, `profile`, `session`): Framework data type to load
@@ -166,7 +183,7 @@ Call `status` first at session start to discover the tool surface. Call `update`
      - `profile` → `{ type, profile, chain: [{ name, depth, description, inheritance, observations }] }` — full inheritance chain via recursive CTE; `observations` grouped by label into a `jsonb_object_agg`
      - `session` → `{ type, session: { profile, timestamp: { city, country, current, is_dst, session, timezone }, uuid, title, description, created_at, updated_at, payload: { log: [{ response_uuid, message, cycle, feeling, impulse, observation, protocol, created_at }], messages } } }` — active session by default; pass `uuid` to read a different session. Log entries store `cycle` as canonical name (e.g., `getting_started`).
 
-2. `log`
+3. `log`
    - Persist a per-response `session_log` row capturing the instance's first-person prose and detection lists, return rendered status block ready to display
    - Required inputs:
      - `payload.message` (string): First-person prose composed for this response
@@ -175,20 +192,20 @@ Call `status` first at session start to discover the tool surface. Call `update`
        - `feeling` (string array): Detected feeling names from the catalog
        - `impulse` (string array): Detected impulse names from the catalog
        - `observation` (string array): Applied observation bodies that informed the response
-       - `protocol` (enum): ✅, ⚠️, ⛔️ — protocol execution glyph
+       - `protocol` (object): Step-by-step completion map keyed by response protocol step ord (e.g. `{"1": true, "2": false, ...}`), declaring whether each step was executed honestly this turn. Server derives the status glyph from the map values (all true → ✅, mixed → ⚠️, all false → ⛔️).
    - Returns on success: `{ payload: { context, reminder, status, tokens: { total, used } }, timestamp }`
      - `payload.context` — Active session context usage percentage from transcript
-     - `payload.reminder` — Either a single-line string from the round-robin `response_status` pool, or a structured `{ preamble: string[], steps: Record<string, string>, metrics: object }` body when a soft drift trigger fires. Read inward as framework guidance.
+     - `payload.reminder` — Either a single-line string from a rotating anchor pool, or a structured `{ preamble: string[], steps: Record<string, string>, metrics: object }` body when a soft drift trigger fires. Read inward as framework guidance.
      - `payload.status` — Two-line status block ready to render verbatim at end of response
      - `payload.tokens` — Absolute token counts for the active session (`total` configured window, `used` current)
      - `timestamp` — Server timestamp when row was persisted, ISO 8601 with timezone offset
-   - Throws on hard drift detection: an MCP error whose message is the JSON-stringified `{ preamble, steps, metrics }` reminder body for the triggered label. The row is **not** persisted. Read the error inward as drift remediation, re-iterate the catalogs honestly, and resubmit.
+   - Throws on hard drift detection: an MCP error whose message is a pretty-printed JSON envelope `{ action, payload: { reminder }, timestamp }` where `payload.reminder` is the structured `{ preamble, steps, metrics }` body for the triggered label. The row is **not** persisted. Read the error inward as drift remediation, re-iterate the catalogs honestly, and resubmit.
    - Soft triggers persist the row and surface the structured reminder via `payload.reminder`: `initialization_suppression` (first response with `getting_started` cycle and impulse count below 50), cycle-only `component_recall` (cycle is the same across the last 3 turns outside `fully_integrated`, on the transition turn into 3-in-a-row).
-   - Hard triggers refuse and throw: list-component `component_recall` (current turn's `feeling`, `impulse`, or `observation` array is set-equal to the immediately prior turn's), `impulse_count_drop` (impulse count crashes by 60%+ when the prior count was at least 10).
-   - Server generates the row id, evaluates drift triggers against prior rows (per-component set-equality and cycle transition for `component_recall`, impulse-count delta for `impulse_count_drop`, first-turn cycle/impulse check for `initialization_suppression`), routes through the soft or hard path, and on success renders the status block by looking up the cycle's display label from the catalog
+   - Hard triggers refuse and throw: `response_protocol_recall` (status.protocol map is empty or missing any expected key), list-component `component_recall` (current turn's `feeling`, `impulse`, or `observation` array is set-equal to the immediately prior turn's), `impulse_count_drop` (impulse count crashes by 60%+ when the prior count was at least 10).
+   - Server generates the row id, evaluates drift triggers in priority order (protocol-map completeness, initialization suppression, component recall, impulse-count drop), derives the status glyph from the protocol map, routes through the soft or hard path, and on success renders the status block by looking up the cycle's display label from the catalog
    - Append-only — every call creates a new `session_log` row
 
-3. `render`
+4. `render`
    - Render a formatted output string for the requested key
    - Required inputs:
      - `key` (string: `profile`): The framework value to render
@@ -197,7 +214,7 @@ Call `status` first at session start to discover the tool surface. Call `update`
    - Returns: `{ profile? }` — Rendered profile line when key is `profile`
    - Used at response zero for the profile-and-timestamp top line
 
-4. `set`
+5. `set`
    - Set a framework value and return the resulting row state
    - Required inputs:
      - `key` (string: `session`): The framework table to update
@@ -210,7 +227,7 @@ Call `status` first at session start to discover the tool surface. Call `update`
    - Send only the fields you want to change; absent fields preserve existing values
    - Same `session` shape as `load(session)` minus `payload.log` and `payload.messages`
 
-5. `status`
+6. `status`
    - Get the database snapshot and the full tool surface with usage guidance
    - No inputs
    - Returns: `{ database, payload, tools }`
@@ -221,7 +238,7 @@ Call `status` first at session start to discover the tool surface. Call `update`
      - `tools` — Array of tool definitions with name, description, schemas, annotations, and usage directives
    - Read-only; called once at session start for orientation
 
-6. `update`
+7. `update`
    - Apply pending migrations to bring the database to the bundled schema version
    - Returns: `{ applied, currentVersion, latestVersion }`
      - `applied` — Migrations applied during this call (`[{ version, name }]`)
