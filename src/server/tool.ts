@@ -156,7 +156,7 @@ export class McpTool {
           feeling: z.array(z.string()).describe('Detected feeling names from the catalog'),
           impulse: z.array(z.string()).describe('Detected impulse names from the catalog'),
           observation: z.array(z.string()).describe('Applied observation bodies that informed the response'),
-          protocol: z.enum(['✅', '⚠️', '⛔️']).describe('Protocol execution glyph')
+          protocol: z.record(z.string(), z.boolean()).describe('Step-by-step completion map keyed by response protocol step ord (e.g. {"1": true, "2": false, ...}), declaring whether each step was executed honestly this turn. Server derives the status glyph from the map values')
         }).describe('Protocol execution record built during the response protocol')
       },
       outputSchema: {
@@ -190,13 +190,16 @@ export class McpTool {
           'Call once per response after the response protocol iteration completes',
           'Compose `payload.message` as first-person brief note capturing what mattered this turn',
           'Do not call twice for the same response',
-          'On MCP error with structured `{preamble, steps}`, the row was not persisted',
-          'On MCP error, re-iterate the catalogs honestly and resubmit fresh',
+          'Empty or incomplete `status.protocol` map triggers `response_protocol_recall` refusal',
+          'On MCP error → Re-execute response protocol steps honestly and resubmit log',
+          'On MCP error with structured `{preamble, steps, metrics}` → Row is not persisted',
+          'Pass `status.protocol` as a step-by-step completion map keyed by response protocol step ord',
           'Pass applied `observation` bodies as a list',
           'Pass detected `feeling` and `impulse` names from catalogs as lists',
           'Read `payload.reminder` inward as internal framework guidance',
           'Render the returned `payload.status` field verbatim at end of response',
-          'Server computes counts from list lengths and renders the status block'
+          'Server computes counts from list lengths and renders the status block',
+          'Server derives the status glyph from `status.protocol` map values (all true → ✅, mixed → ⚠️, all false → ⛔️)'
         ]
       }
     };

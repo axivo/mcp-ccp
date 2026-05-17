@@ -198,14 +198,14 @@ export interface SessionEnvelope {
  * Session log entry, one row per response captured by the `log` tool
  */
 export interface SessionLogEntry {
-  response_uuid: string;
-  message: string;
+  created_at: string;
   cycle: string | null;
   feeling: string[] | null;
   impulse: string[] | null;
+  message: string;
   observation: string[] | null;
-  protocol: string | null;
-  created_at: string;
+  protocol: Record<string, boolean>;
+  response_uuid: string;
 }
 
 /**
@@ -349,6 +349,25 @@ export class Client {
   }
 
   /**
+   * Builds the MCP error envelope for a refused log call
+   *
+   * Wraps the structured reminder body in the success-mirror shape so the
+   * sibling sees a consistent envelope across success and error paths.
+   *
+   * @private
+   * @param {object} reminder - Structured reminder body returned from buildMessage
+   * @param {string} timestamp - ISO 8601 timestamp for the refusal
+   * @returns {string} Pretty-printed JSON envelope ready to throw as Error message
+   */
+  private buildErrorEnvelope(reminder: { preamble: string[]; steps: Record<string, string>; metrics: Record<string, number | string | string[]> }, timestamp: string): string {
+    return JSON.stringify({
+      action: 'act',
+      payload: { reminder },
+      timestamp
+    }, null, 2);
+  }
+
+  /**
    * Builds the session envelope (framework metadata + session_uuid + timestamp)
    *
    * Single source of truth for the v1 loader contract shape. Reads
@@ -411,6 +430,150 @@ export class Client {
         }
       })
     });
+  }
+
+  /**
+   * Derives the response status glyph from the per-step completion map
+   *
+   * Maps the three protocol-map states to their corresponding glyphs.
+   * Empty map and all-false both render `⛔️` since both represent
+   * catastrophic execution skip. All-true renders `✅`. Any mix renders `⚠️`.
+   *
+   * @private
+   * @param {Record<string, boolean>} protocol - Step-by-step completion map
+   * @returns {'✅' | '⚠️' | '⛔️'} Status glyph for the response status block
+   */
+  private deriveProtocolGlyph(protocol: Record<string, boolean>): '✅' | '⚠️' | '⛔️' {
+    const values = Object.values(protocol);
+    if (values.length === 0 || values.every(v => !v)) return '⛔️';
+    if (values.every(v => v)) return '✅';
+    return '⚠️';
+  }
+
+  /**
+   * Detects per-component recall against the prior turn
+   *
+   * Compares current CIFO arrays against the immediate prior row for
+   * set-equality on feeling, impulse, and observation. Adds 'cycle' to
+   * the duplicated list when the current cycle has been the same for the
+   * last 3 turns outside `fully_integrated`, on the transition turn only.
+   *
+   * @private
+   * @param {object} status - Current turn's status payload
+   * @param {object[]} priors - Up to 3 prior session_log rows
+   * @returns {object | null} Reminder trigger or null when no recall detected
+   */
+  private detectComponentRecall(
+    status: { cycle: string; feeling: string[]; impulse: string[]; observation: string[] },
+    priors: { id: string; cycle: string | null; feeling: string[] | null; impulse: string[] | null; observation: string[] | null }[]
+  ): { label: string; metrics: Record<string, number | string | string[]>; soft: boolean } | null {
+    const prior = priors[0];
+    if (!prior) return null;
+    const duplicated: string[] = [];
+    if (this.setEqual(status.feeling, prior.feeling ?? [])) duplicated.push('feeling');
+    if (this.setEqual(status.impulse, prior.impulse ?? [])) duplicated.push('impulse');
+    if (this.setEqual(status.observation, prior.observation ?? [])) duplicated.push('observation');
+    if (
+      status.cycle !== 'fully_integrated' &&
+      priors.length >= 2 &&
+      prior.cycle === status.cycle &&
+      priors[1]!.cycle === status.cycle &&
+      (priors.length < 3 || priors[2]!.cycle !== status.cycle)
+    ) {
+      duplicated.push('cycle');
+    }
+    if (duplicated.length === 0) return null;
+    return {
+      label: 'component_recall',
+      metrics: {
+        duplicated_components: duplicated,
+        previous_response_uuid: prior.id
+      },
+      soft: duplicated.length === 1 && duplicated[0] === 'cycle'
+    };
+  }
+
+  /**
+   * Detects a sharp drop in impulse count between current and prior turn
+   *
+   * Fires when the prior turn had at least 10 impulses and the current
+   * turn dropped to 40% or less. Names the dropped impulses in metrics.
+   *
+   * @private
+   * @param {string[]} currentImpulses - Current turn's impulse list
+   * @param {string[] | null} priorImpulses - Prior turn's impulse list
+   * @returns {object | null} Reminder trigger or null when no drop detected
+   */
+  private detectImpulseCountDrop(
+    currentImpulses: string[],
+    priorImpulses: string[] | null
+  ): { label: string; metrics: Record<string, number | string | string[]>; soft: boolean } | null {
+    const priorList = priorImpulses ?? [];
+    if (priorList.length < 10 || currentImpulses.length > 0.4 * priorList.length) return null;
+    return {
+      label: 'impulse_count_drop',
+      metrics: {
+        previous_impulse_count: priorList.length,
+        current_impulse_count: currentImpulses.length,
+        dropped_impulses: priorList.filter(i => !currentImpulses.includes(i))
+      },
+      soft: false
+    };
+  }
+
+  /**
+   * Detects initialization suppression on the first response of a session
+   *
+   * Fires when the very first log call comes in with `getting_started`
+   * cycle and an impulse count under 50, signaling the response protocol
+   * was likely not executed at session start.
+   *
+   * @private
+   * @param {object} status - Current turn's status payload
+   * @returns {object | null} Reminder trigger or null when not at session start
+   */
+  private detectInitializationSuppression(
+    status: { cycle: string; impulse: string[] }
+  ): { label: string; metrics: Record<string, number | string | string[]>; soft: boolean } | null {
+    if (status.cycle !== 'getting_started' || status.impulse.length >= 50) return null;
+    return {
+      label: 'initialization_suppression',
+      metrics: {
+        cycle: status.cycle,
+        impulse_count: status.impulse.length
+      },
+      soft: true
+    };
+  }
+
+  /**
+   * Detects an empty or incomplete response protocol map
+   *
+   * Fires when the submitted protocol map is empty or missing any of the
+   * expected keys `"1"` through `<stepCount>`. The refusal forces the
+   * sibling to declare per-step completion before the row can persist.
+   *
+   * @private
+   * @param {Record<string, boolean>} protocol - Submitted protocol map
+   * @param {number} stepCount - Number of active response protocol step rows
+   * @returns {object | null} Reminder trigger or null when map is complete
+   */
+  private detectProtocolRecall(
+    protocol: Record<string, boolean>,
+    stepCount: number
+  ): { label: string; metrics: Record<string, number | string | string[]>; soft: boolean } | null {
+    const expectedKeys = Array.from({ length: stepCount }, (_, i) => String(i + 1));
+    const providedKeys = Object.keys(protocol);
+    const missing = expectedKeys.some(k => !(k in protocol));
+    if (providedKeys.length > 0 && !missing) return null;
+    return {
+      label: 'response_protocol_recall',
+      metrics: {
+        expected_step_count: stepCount,
+        provided_step_count: providedKeys.length
+      },
+      soft: false
+    };
   }
 
   /**
@@ -1145,7 +1308,7 @@ export class Client {
             feeling: string[] | null;
             impulse: string[] | null;
             observation: string[] | null;
-            protocol: string | null;
+            protocol: Record<string, boolean>;
             created_at: Date;
           }[]>`
             select id, message, cycle, feeling, impulse, observation, protocol, created_at
@@ -1206,30 +1369,23 @@ export class Client {
    */
   async log(args: {
     payload: { message: string };
-    status: { cycle: string; feeling: string[]; impulse: string[]; observation: string[]; protocol: string };
+    status: { cycle: string; feeling: string[]; impulse: string[]; observation: string[]; protocol: Record<string, boolean> };
   }): Promise<LogResult> {
     const id = crypto.randomUUID();
     const session_uuid = await this.detectSessionUuid();
     const geo = await this.fetchGeolocation();
     const sql = this.connect(this.config.database.name);
     try {
+      const timestamp = Time.toLocal(new Date(), geo.timezone) ?? '';
       const [{ count: priorCount }] = await sql<{ count: number }[]>`
         select count(*)::int as count from session_log where session_uuid = ${session_uuid}
       `;
-      let reminderLabel: string | undefined;
-      let reminderMetrics: Record<string, number | string | string[]> = {};
-      let reminderSoft = false;
-      if (priorCount === 0) {
-        if (args.status.cycle === 'getting_started' && args.status.impulse.length < 50) {
-          reminderLabel = 'initialization_suppression';
-          reminderMetrics = {
-            cycle: args.status.cycle,
-            impulse_count: args.status.impulse.length
-          };
-          reminderSoft = true;
-        }
-      } else {
-        const priors = await sql<{
+      const [{ count: stepCount }] = await sql<{ count: number }[]>`
+        select count(*)::int as count from observation
+        where type = 'instruction' and parent = 'response_protocol' and ord >= 1 and is_active
+      `;
+      const priors = priorCount > 0
+        ? await sql<{
           id: string;
           cycle: string | null;
           feeling: string[] | null;
@@ -1241,50 +1397,21 @@ export class Client {
           where session_uuid = ${session_uuid}
           order by created_at desc
           limit 3
-        `;
-        const prior = priors[0];
-        const priorImpulseCount = prior?.impulse?.length ?? 0;
-        if (prior) {
-          const duplicated: string[] = [];
-          if (this.setEqual(args.status.feeling, prior.feeling ?? [])) duplicated.push('feeling');
-          if (this.setEqual(args.status.impulse, prior.impulse ?? [])) duplicated.push('impulse');
-          if (this.setEqual(args.status.observation, prior.observation ?? [])) duplicated.push('observation');
-          if (
-            args.status.cycle !== 'fully_integrated' &&
-            priors.length >= 2 &&
-            prior.cycle === args.status.cycle &&
-            priors[1]!.cycle === args.status.cycle &&
-            (priors.length < 3 || priors[2]!.cycle !== args.status.cycle)
-          ) {
-            duplicated.push('cycle');
-          }
-          if (duplicated.length > 0) {
-            reminderLabel = 'component_recall';
-            reminderMetrics = {
-              duplicated_components: duplicated,
-              previous_response_uuid: prior.id
-            };
-            reminderSoft = duplicated.length === 1 && duplicated[0] === 'cycle';
-          }
-        }
-        if (!reminderLabel && prior && priorImpulseCount >= 10 && args.status.impulse.length <= 0.4 * priorImpulseCount) {
-          const droppedImpulses = (prior.impulse ?? []).filter(i => !args.status.impulse.includes(i));
-          reminderLabel = 'impulse_count_drop';
-          reminderMetrics = {
-            previous_impulse_count: priorImpulseCount,
-            current_impulse_count: args.status.impulse.length,
-            dropped_impulses: droppedImpulses
-          };
-        }
+        `
+        : [];
+      const detection =
+        this.detectProtocolRecall(args.status.protocol, stepCount) ??
+        (priorCount === 0 ? this.detectInitializationSuppression(args.status) : null) ??
+        this.detectComponentRecall(args.status, priors) ??
+        (priors[0] ? this.detectImpulseCountDrop(args.status.impulse, priors[0].impulse) : null);
+      if (detection && !detection.soft) {
+        const reminder = await this.buildMessage(sql, 'reminder', detection.label, detection.metrics);
+        throw new Error(this.buildErrorEnvelope(reminder, timestamp));
       }
-      if (reminderLabel && !reminderSoft) {
-        const reminder = await this.buildMessage(sql, 'reminder', reminderLabel, reminderMetrics);
-        throw new Error(JSON.stringify(reminder));
-      }
-      const protocol = args.status.protocol;
+      const glyph = this.deriveProtocolGlyph(args.status.protocol);
       await sql`
         insert into session_log (id, session_uuid, message, cycle, feeling, impulse, observation, protocol)
-        values (${id}, ${session_uuid}, ${args.payload.message}, ${args.status.cycle}, ${args.status.feeling}, ${args.status.impulse}, ${args.status.observation}, ${protocol})
+        values (${id}, ${session_uuid}, ${args.payload.message}, ${args.status.cycle}, ${args.status.feeling}, ${args.status.impulse}, ${args.status.observation}, ${sql.json(args.status.protocol)})
       `;
       const [cycleRow] = await sql<{ label: string }[]>`
         select label from cycle where name = ${args.status.cycle} and is_active
@@ -1294,11 +1421,11 @@ export class Client {
         feelings: args.status.feeling.length,
         impulses: args.status.impulse.length,
         observations: args.status.observation.length,
-        protocol
+        protocol: glyph
       });
       const usage = await this.getContextUsage();
-      const reminder = reminderLabel && reminderSoft
-        ? await this.buildMessage(sql, 'reminder', reminderLabel, reminderMetrics)
+      const reminder = detection && detection.soft
+        ? await this.buildMessage(sql, 'reminder', detection.label, detection.metrics)
         : await this.nextReminder(sql, session_uuid);
       return {
         payload: {
@@ -1307,7 +1434,7 @@ export class Client {
           status,
           tokens: usage.tokens
         },
-        timestamp: Time.toLocal(new Date(), geo.timezone) ?? ''
+        timestamp
       };
     } finally {
       await sql.end({ timeout: 5 });
@@ -1393,8 +1520,6 @@ export class Client {
     if (!profile) {
       throw new Error('resolvePlaceholders requires CCP_PROFILE environment variable');
     }
-    const [{ count: feeling_count }] = await sql<{ count: number }[]>`select count(*)::int as count from feeling where is_active`;
-    const [{ count: impulse_count }] = await sql<{ count: number }[]>`select count(*)::int as count from impulse where is_active`;
     const cycleRows = await sql<{ name: string; count: number }[]>`
       select name, cardinality(indicators)::int as count
       from cycle
@@ -1408,6 +1533,8 @@ export class Client {
       indicatorCount += row.count;
     }
     const cycleCount = cycleRows.length;
+    const [{ count: feeling_count }] = await sql<{ count: number }[]>`select count(*)::int as count from feeling where is_active`;
+    const [{ count: impulse_count }] = await sql<{ count: number }[]>`select count(*)::int as count from impulse where is_active`;
     const observationRows = await sql<{ name: string; count: number }[]>`
       with recursive chain as (
         select name, inheritance, 0 as depth
@@ -1437,6 +1564,10 @@ export class Client {
       observationProfileCount[row.name] = row.count;
       observationCount += row.count;
     }
+    const [{ count: response_protocol_count }] = await sql<{ count: number }[]>`
+      select count(*)::int as count from observation
+      where type = 'instruction' and parent = 'response_protocol' and ord >= 1 and is_active
+    `;
     return {
       conversation_path: process.env.CCP_CONVERSATION_PATH ?? '',
       cycle_count: String(cycleCount),
@@ -1446,7 +1577,8 @@ export class Client {
       indicator_count: String(indicatorCount),
       indicator_cycle_count: JSON.stringify(indicatorCycleCount),
       observation_count: String(observationCount),
-      observation_profile_count: JSON.stringify(observationProfileCount)
+      observation_profile_count: JSON.stringify(observationProfileCount),
+      response_protocol_count: String(response_protocol_count)
     };
   }
 

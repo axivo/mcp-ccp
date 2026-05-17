@@ -154,7 +154,7 @@ create table session_log (
   feeling       text[],
   impulse       text[],
   observation   text[],
-  protocol      text,
+  protocol      jsonb not null default '{}'::jsonb,
   created_at    timestamptz not null default now()
 );
 
