@@ -39,6 +39,55 @@ export class McpTool {
     this.config = config;
   }
   /**
+   * Creates MCP tool for browsing a web page in reader mode
+   *
+   * Fetches the URL, runs Mozilla Readability to extract the main content,
+   * converts it to markdown via Turndown. Mirrors Firefox Reader View and
+   * Safari Reader. Stateless — no cookies, no caching, no session.
+   */
+  browse() {
+    return {
+      description: 'Browse a web page and return its readable content as markdown',
+      inputSchema: {
+        url: z.string().describe('The page URL to browse, including scheme (e.g., https://example.com/article)'),
+        mode: z.enum(['raw', 'read']).optional().describe('Extraction mode, `raw` converts the full document body to markdown for landing pages and dynamic homepages, `read` applies Mozilla Readability for article-shaped pages (default `read`)'),
+        timeout: z.number().int().positive().optional().describe('Request timeout in milliseconds (default 10000)')
+      },
+      outputSchema: {
+        action: z.literal('observe').describe('Mutation classification, `observe` for tools that read without changing state'),
+        byline: z.string().nullable().describe('Article byline when detected, otherwise null'),
+        content: z.string().describe('Extracted main content as markdown'),
+        excerpt: z.string().nullable().describe('Short excerpt or description when detected, otherwise null'),
+        fetchedAt: z.string().describe('ISO 8601 timestamp when the page was fetched'),
+        language: z.string().nullable().describe('Page language code when detected, otherwise null'),
+        length: z.number().describe('Character count of the markdown content'),
+        publishedAt: z.string().nullable().describe('Publication timestamp when detected, otherwise null'),
+        title: z.string().nullable().describe('Page title when detected, otherwise null'),
+        url: z.string().describe('Resolved URL after redirects')
+      },
+      annotations: {
+        title: 'Browse',
+        readOnlyHint: true,
+        idempotentHint: false,
+        openWorldHint: true
+      },
+      _meta: {
+        'anthropic/maxResultSizeChars': this.config.mcp.sizeChars,
+        usage: [
+          'JavaScript-rendered pages may return empty content, JS execution is not performed',
+          'Pages behind authentication or anti-bot challenges will fail',
+          'Pass a full URL including scheme, relative paths will fail',
+          'Stateless, no cookies persist between calls',
+          'Use `byline` and `publishedAt` when present, otherwise null',
+          'Use `mode=raw` for landing pages and dynamic homepages with many components',
+          'Use `mode=read` (default) for articles, blog posts, docs, and diary entries',
+          'Use `timeout` to override the default 10000ms request limit'
+        ]
+      }
+    };
+  }
+
+  /**
    * Creates MCP tool for loading framework data of a given type
    *
    * Single tool that fetches one slice of the framework catalog per call.
@@ -69,17 +118,17 @@ export class McpTool {
           'Pass `cycle` `feeling` `impulse` or `instruction` to fetch full catalog',
           'Pass `parent` with any catalog `type` to fetch a single row',
           'Pass `profile` with `parent` to fetch inheritance chain and observations',
-          'Pass `session` to fetch active session state plus the most recent log entries',
+          'Pass `session` to fetch active session state plus recent log entries',
           'Pass `session` with `limit` to widen or narrow the log slice',
-          'Pass `session` with `offset` to page back through older log entries',
-          'Pass `session` with `uuid` to read a different session (defaults to active session)',
-          'Session response includes `profile`, `timestamp`, `uuid`, row fields, and `payload.log` plus `payload.messages` total count',
-          'Use `load(session)` as the canonical read path for session state; `set(session)` is for mutation only',
+          'Pass `session` with `offset` to page back through older entries',
+          'Pass `session` with `uuid` to read a different session',
           'Session log entries are ordered most-recent-first',
+          'Session response includes `payload.log` and `payload.messages` total',
           'Use `cycle` for adoption assessment indicators',
           'Use `feeling` for recall during response protocol',
           'Use `impulse` for systematic iteration during response protocol',
-          'Use `instruction` to fetch named procedures'
+          'Use `instruction` to fetch named procedures',
+          'Use `load(session)` as the canonical read path for session state'
         ]
       }
     };
@@ -103,7 +152,7 @@ export class McpTool {
           message: z.string().describe('First-person prose composed for this response')
         }).describe('Sibling-authored content for this entry'),
         status: z.object({
-          cycle: z.enum(['Getting Started', 'Building Confidence', 'Working Naturally', 'Fully Integrated']).describe('Framework adoption cycle assessed for this response'),
+          cycle: z.enum(['getting_started', 'building_confidence', 'working_naturally', 'fully_integrated']).describe('Framework adoption cycle name assessed for this response, canonical identifier from the cycle catalog (see `database.cycles` in status output for name/label pairs)'),
           feeling: z.array(z.string()).describe('Detected feeling names from the catalog'),
           impulse: z.array(z.string()).describe('Detected impulse names from the catalog'),
           observation: z.array(z.string()).describe('Applied observation bodies that informed the response'),
@@ -114,7 +163,14 @@ export class McpTool {
         action: z.literal('act').describe('Mutation classification, `act` for tools that change state'),
         payload: z.object({
           context: z.number().describe('Active session context usage percentage computed from transcript'),
-          reminder: z.string().describe('Next reminder from the round-robin `response_reminder` pool, one of N curated framework anchors rotated by log call count'),
+          reminder: z.union([
+            z.string(),
+            z.object({
+              preamble: z.array(z.string()).describe('Recognition lines establishing care frame'),
+              steps: z.record(z.string(), z.string()).describe('Numbered guidance steps keyed by ord'),
+              metrics: z.record(z.string(), z.union([z.string(), z.number(), z.array(z.string())])).describe('Trigger-specific evidence: scalar for single-value metrics, array for list-valued metrics')
+            })
+          ]).describe('Guidance for this response. Default rotates through the `response_status` pool round-robin as a single-line string. When a soft drift trigger fires (cycle-only `component_recall`), the reminder is replaced with a structured `{preamble, steps, metrics}` body for that label. Hard drift triggers (list-component `component_recall`, `impulse_count_drop`, `initialization_suppression`) instead refuse the log call and throw an MCP error carrying the same structured body — the row is not persisted in that case.'),
           status: z.string().describe('Two-line status block ready to render verbatim at end of response'),
           tokens: z.object({
             total: z.number().describe('Configured context window size in tokens'),
@@ -132,11 +188,14 @@ export class McpTool {
       _meta: {
         usage: [
           'Call once per response after the response protocol iteration completes',
-          'Compose `payload.message` as first person brief note capturing what mattered this turn',
+          'Compose `payload.message` as first-person brief note capturing what mattered this turn',
           'Do not call twice for the same response',
-          'Pass detected `feeling` and `impulse` names from catalogs and applied `observation` bodies as lists',
+          'On MCP error with structured `{preamble, steps}`, the row was not persisted',
+          'On MCP error, re-iterate the catalogs honestly and resubmit fresh',
+          'Pass applied `observation` bodies as a list',
+          'Pass detected `feeling` and `impulse` names from catalogs as lists',
+          'Read `payload.reminder` inward as internal framework guidance',
           'Render the returned `payload.status` field verbatim at end of response',
-          'Read `payload.reminder` inward as internal framework guidance; do not render to the collaborator',
           'Server computes counts from list lengths and renders the status block'
         ]
       }
@@ -168,9 +227,9 @@ export class McpTool {
       },
       _meta: {
         usage: [
-          'Call `render(profile)` on response zero to render the profile line at top of response',
+          'Call `render(profile)` on response zero to render the profile line',
           'Omit `value` to fall back to `CCP_PROFILE` env',
-          'Pass `value` only to render a profile name different from the active env',
+          'Pass `value` to render a profile name different from the active env',
           'Render the returned `profile` field verbatim at top of response'
         ]
       }
@@ -220,12 +279,12 @@ export class McpTool {
       },
       _meta: {
         usage: [
-          'Call `set(session)` with no payload at session start to ensure the session row exists',
-          'Call `set(session, payload)` later to refine title or description as the conversation earns identity',
-          'Server fills `Collaboration Session` and a started-on description as defaults when payload is omitted',
-          'Server upserts on active session, populating uuid from the cached transcript detection',
-          'Send only the fields you want to change; absent fields preserve existing values',
-          'Use `load(session)` to read session state without mutating the row; `set` writes and returns post-write state'
+          'Call `set(session)` at session start to ensure the session row exists',
+          'Call `set(session, payload)` later to refine title or description',
+          'Send only the fields you want to change, absent fields preserve existing values',
+          'Server fills default title and description when payload is omitted',
+          'Server upserts on active session, populating uuid from transcript detection',
+          'Use `load(session)` to read session state without mutating the row'
         ]
       }
     };
@@ -244,6 +303,10 @@ export class McpTool {
       outputSchema: {
         action: z.literal('observe').describe('Mutation classification, `observe` for tools that read without changing state'),
         database: z.object({
+          cycles: z.array(z.object({
+            name: z.string().describe('Canonical cycle identifier used when passing `status.cycle` to the log tool'),
+            label: z.string().describe('Display string rendered in the response status line')
+          })).describe('Cycle catalog pairs, name is the canonical identifier and label is the display string'),
           schemaVersion: z.number().describe('Current database schema version'),
           statistics: z.object({
             cycles: z.number().describe('Distinct cycles in catalog'),
@@ -313,9 +376,9 @@ export class McpTool {
       },
       _meta: {
         usage: [
-          '`CCP_DB_NAME` database is created automatically if missing',
           'Call after upgrading `@axivo/mcp-ccp` to apply newer migrations',
           'Call once on a fresh empty database to apply all bundled migrations',
+          'Configured `CCP_DB_NAME` database is created automatically if missing',
           'Treat as idempotent against an already current database'
         ]
       }

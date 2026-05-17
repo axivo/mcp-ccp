@@ -28,6 +28,7 @@ export class Mcp {
   private server: McpServer;
   private tool: McpTool;
   private static readonly toolActions = {
+    browse: 'observe',
     load: 'observe',
     log: 'act',
     render: 'observe',
@@ -69,6 +70,7 @@ export class Mcp {
    */
   private getToolDefinitions(): Record<string, unknown>[] {
     const entries: { name: string; config: Record<string, unknown> }[] = [
+      { name: 'browse', config: this.tool.browse() },
       { name: 'load', config: this.tool.load() },
       { name: 'log', config: this.tool.log() },
       { name: 'render', config: this.tool.render() },
@@ -96,6 +98,23 @@ export class Mcp {
       }
       return definition;
     });
+  }
+
+  /**
+   * Handles the browse tool, fetches a URL and returns readable markdown
+   *
+   * @private
+   * @param {object} args - Tool arguments
+   * @returns {Promise<any>} Tool execution response
+   */
+  private async handleBrowse(args: { url: string; mode?: 'raw' | 'read'; timeout?: number }) {
+    try {
+      const result = await this.client.browse(args);
+      return this.structured('browse', result as unknown as Record<string, unknown>);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      return this.client.error(message);
+    }
   }
 
   /**
@@ -128,7 +147,7 @@ export class Mcp {
       return this.structured('log', result as unknown as Record<string, unknown>);
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
-      return this.client.response(`log failed: ${message}`);
+      return this.client.error(message);
     }
   }
 
@@ -209,6 +228,7 @@ export class Mcp {
    * @private
    */
   private registerAll(): void {
+    this.server.registerTool('browse', this.tool.browse(), (args) => this.handleBrowse(args as { url: string; mode?: 'raw' | 'read'; timeout?: number }));
     this.server.registerTool('load', this.tool.load(), (args) => this.handleLoad(args as { type: 'cycle' | 'feeling' | 'impulse' | 'instruction' | 'profile' | 'session'; parent?: string; limit?: number; offset?: number; uuid?: string }));
     this.server.registerTool('log', this.tool.log(), (args) => this.handleLog(args as { payload: { message: string }; status: { cycle: string; feeling: string[]; impulse: string[]; observation: string[]; protocol: string } }));
     this.server.registerTool('render', this.tool.render(), (args) => this.handleRender(args as { key: 'profile'; value?: string }));

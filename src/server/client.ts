@@ -6,11 +6,14 @@
  * @license BSD-3-Clause
  */
 
+import { Readability } from '@mozilla/readability';
 import { createHash } from 'crypto';
 import { existsSync, readdirSync, readFileSync, statSync } from 'fs';
+import { JSDOM } from 'jsdom';
 import { homedir } from 'os';
 import { dirname, join, sep } from 'path';
 import postgres from 'postgres';
+import TurndownService from 'turndown';
 import { fileURLToPath } from 'url';
 import { Time } from '../lib/time.js';
 import { Config } from './config.js';
@@ -27,6 +30,21 @@ interface BundledMigration {
 interface BundledRepeatable {
   name: string;
   path: string;
+}
+
+/**
+ * browse tool result, readable content extracted from a fetched URL
+ */
+export interface BrowseResult {
+  byline: string | null;
+  content: string;
+  excerpt: string | null;
+  fetchedAt: string;
+  language: string | null;
+  length: number;
+  publishedAt: string | null;
+  title: string | null;
+  url: string;
 }
 
 /**
@@ -94,7 +112,11 @@ export type LoadType = 'cycle' | 'feeling' | 'impulse' | 'instruction' | 'profil
 export interface LogResult {
   payload: {
     context: number;
-    reminder: string;
+    reminder: string | {
+      preamble: string[];
+      steps: Record<string, string>;
+      metrics: Record<string, number | string | string[]>;
+    };
     status: string;
     tokens: {
       total: number;
@@ -124,17 +146,10 @@ export interface ProfileNode {
 }
 
 /**
- * Session log entry, one row per response captured by the `log` tool
+ * render tool result, rendered output for the requested key
  */
-export interface SessionLogEntry {
-  response_uuid: string;
-  message: string;
-  cycle: string | null;
-  feeling: string[] | null;
-  impulse: string[] | null;
-  observation: string[] | null;
-  protocol: string | null;
-  created_at: string;
+export interface RenderResult {
+  profile?: string;
 }
 
 /**
@@ -180,10 +195,17 @@ export interface SessionEnvelope {
 }
 
 /**
- * render tool result, rendered output for the requested key
+ * Session log entry, one row per response captured by the `log` tool
  */
-export interface RenderResult {
-  profile?: string;
+export interface SessionLogEntry {
+  response_uuid: string;
+  message: string;
+  cycle: string | null;
+  feeling: string[] | null;
+  impulse: string[] | null;
+  observation: string[] | null;
+  protocol: string | null;
+  created_at: string;
 }
 
 /**
@@ -202,6 +224,7 @@ export interface SetResult {
  * status tool result, database snapshot at session start
  */
 export interface StatusResult {
+  cycles: { name: string; label: string }[];
   schemaVersion: number;
   statistics: {
     cycles: number;
@@ -282,6 +305,47 @@ export class Client {
     await sql.begin(async tx => {
       await tx.unsafe(body);
     });
+  }
+
+  /**
+   * Builds a structured reminder body for the given reminder label
+   *
+   * Queries the `observation` table for rows under `type='payload',
+   * parent=<parent>, label=<label>`, groups them into preamble (ord=0) and
+   * steps (ord>=1), applies placeholder substitution, and attaches the
+   * caller-supplied metrics. Reusable across any payload kind (today:
+   * `reminder`, future: greetings, compaction notices, etc.).
+   *
+   * @private
+   * @param {postgres.Sql} sql - Active connection
+   * @param {string} parent - Payload kind grouping (e.g., 'reminder')
+   * @param {string} label - Specific message identifier within the parent
+   * @param {Record<string, number | string | string[]>} metrics - Caller-supplied evidence
+   * @returns {Promise<{preamble: string[]; steps: Record<string, string>; metrics: Record<string, number | string | string[]>}>} Composed message body
+   */
+  private async buildMessage(
+    sql: postgres.Sql,
+    parent: string,
+    label: string,
+    metrics: Record<string, number | string | string[]>
+  ): Promise<{ preamble: string[]; steps: Record<string, string>; metrics: Record<string, number | string | string[]> }> {
+    const rows = await sql<{ ord: number; body: string }[]>`
+      select ord, body from observation
+      where type = 'payload' and parent = ${parent} and label = ${label} and is_active
+      order by ord, id
+    `;
+    const placeholders = await this.resolvePlaceholders(sql);
+    const preamble: string[] = [];
+    const steps: Record<string, string> = {};
+    for (const row of rows) {
+      const body = this.substitute(row.body, placeholders);
+      if (row.ord === 0) {
+        preamble.push(body);
+      } else {
+        steps[String(row.ord)] = body;
+      }
+    }
+    return { preamble, steps, metrics };
   }
 
   /**
@@ -611,6 +675,77 @@ export class Client {
   }
 
   /**
+   * Fetches a web page and returns its content as markdown
+   *
+   * Two modes:
+   *
+   * - `read` (default) — HTTP fetch → JSDOM parse → Mozilla Readability
+   *   extraction → Turndown HTML-to-markdown conversion. Mirrors Firefox
+   *   Reader View and Safari Reader. Best for article-shaped pages (blog
+   *   posts, docs, diary entries). Throws when the extractor cannot find
+   *   readable content.
+   *
+   * - `raw` — HTTP fetch → JSDOM parse → Turndown on the full document
+   *   body. Skips Readability entirely. Best for landing pages, product
+   *   homepages, and pages with many non-article components where
+   *   Readability discards most content.
+   *
+   * Stateless — no caching, no cookies, no session.
+   *
+   * @param {object} args - Tool arguments
+   * @param {string} args.url - The page URL to browse, including scheme
+   * @param {string} [args.mode] - Extraction mode (default `readable`)
+   * @param {number} [args.timeout] - Request timeout in milliseconds (default 10000)
+   * @returns {Promise<BrowseResult>} Extracted content with metadata
+   */
+  async browse(args: { url: string; mode?: 'raw' | 'read'; timeout?: number }): Promise<BrowseResult> {
+    const mode = args.mode ?? 'read';
+    const timeout = args.timeout ?? 10000;
+    const response = await fetch(args.url, {
+      signal: AbortSignal.timeout(timeout),
+      headers: { 'User-Agent': 'CCP-Browse/1.0' }
+    });
+    if (!response.ok) {
+      throw new Error(`Fetch failed with status ${response.status} ${response.statusText}`);
+    }
+    const html = await response.text();
+    const dom = new JSDOM(html, { url: response.url });
+    const turndown = new TurndownService({ codeBlockStyle: 'fenced', headingStyle: 'atx' });
+    if (mode === 'raw') {
+      const titleEl = dom.window.document.querySelector('title');
+      const langAttr = dom.window.document.documentElement.getAttribute('lang');
+      const content = turndown.turndown(dom.window.document.body.innerHTML);
+      return {
+        byline: null,
+        content,
+        excerpt: null,
+        fetchedAt: new Date().toISOString(),
+        language: langAttr ?? null,
+        length: content.length,
+        publishedAt: null,
+        title: titleEl?.textContent ?? null,
+        url: response.url
+      };
+    }
+    const article = new Readability(dom.window.document).parse();
+    if (!article || !article.content) {
+      throw new Error('Could not extract readable content from the page');
+    }
+    const content = turndown.turndown(article.content);
+    return {
+      byline: article.byline ?? null,
+      content,
+      excerpt: article.excerpt ?? null,
+      fetchedAt: new Date().toISOString(),
+      language: article.lang ?? null,
+      length: content.length,
+      publishedAt: article.publishedTime ?? null,
+      title: article.title ?? null,
+      url: response.url
+    };
+  }
+
+  /**
    * Detects the active Claude Code session UUID from transcript files
    *
    * Reads `~/.claude/projects/<slug>/*.jsonl` where slug is the working
@@ -640,6 +775,19 @@ export class Client {
     }
     this.cachedSessionUuid = '';
     return this.cachedSessionUuid;
+  }
+
+  /**
+   * Creates a standardized error response for tool execution
+   *
+   * Marks the response with `isError: true` so the MCP SDK skips output
+   * schema validation and the client recognizes the call as failed.
+   *
+   * @param {string} text - The error message text
+   * @returns {object} Standardized MCP error response format
+   */
+  error(text: string): { content: { type: 'text'; text: string }[]; isError: true } {
+    return { content: [{ type: 'text', text }], isError: true };
   }
 
   /**
@@ -722,12 +870,12 @@ export class Client {
             with recursive chain as (
               select name, description, inheritance, 0 as depth
               from profile
-              where name = ${parent} and status = 'active'
+              where name = ${parent} and is_active
               union all
               select p.name, p.description, p.inheritance, c.depth + 1
               from profile p
               join chain c on p.name = any(c.inheritance)
-              where p.status = 'active'
+              where p.is_active
             ),
             uniq as (
               select distinct on (name) name, description, inheritance, depth
@@ -740,7 +888,7 @@ export class Client {
                 coalesce(o.label, 'context') as label,
                 array_agg(o.body order by o.id) as bodies
               from observation o
-              where o.type = 'profile' and o.status = 'active'
+              where o.type = 'profile' and o.is_active
               group by o.parent, coalesce(o.label, 'context')
             )
             select
@@ -784,7 +932,7 @@ export class Client {
             }[]>`
                 select name, ord, label, indicators
                 from cycle
-                where status = 'active' and name = ${parent}
+                where is_active and name = ${parent}
                 order by ord
               `
             : await sql<{
@@ -795,7 +943,7 @@ export class Client {
             }[]>`
                 select name, ord, label, indicators
                 from cycle
-                where status = 'active'
+                where is_active
                 order by ord
               `;
           return {
@@ -829,8 +977,8 @@ export class Client {
                   ) as observations
                 from feeling f
                 left join observation o
-                  on o.type = 'feeling' and o.parent = f.name and o.status = 'active'
-                where f.status = 'active' and f.name = ${parent}
+                  on o.type = 'feeling' and o.parent = f.name and o.is_active
+                where f.is_active and f.name = ${parent}
                 group by f.name, f.valence, f.behavioral, f.cognitive, f.physical
               `
             : await sql<{
@@ -853,8 +1001,8 @@ export class Client {
                   ) as observations
                 from feeling f
                 left join observation o
-                  on o.type = 'feeling' and o.parent = f.name and o.status = 'active'
-                where f.status = 'active'
+                  on o.type = 'feeling' and o.parent = f.name and o.is_active
+                where f.is_active
                 group by f.name, f.valence, f.behavioral, f.cognitive, f.physical
                 order by f.valence, f.name
               `;
@@ -891,8 +1039,8 @@ export class Client {
                   ) as observations
                 from impulse i
                 left join observation o
-                  on o.type = 'impulse' and o.parent = i.name and o.status = 'active'
-                where i.status = 'active' and i.name = ${parent}
+                  on o.type = 'impulse' and o.parent = i.name and o.is_active
+                where i.is_active and i.name = ${parent}
                 group by i.name, i.category, i.experience, i.feel, i.think
               `
             : await sql<{
@@ -915,8 +1063,8 @@ export class Client {
                   ) as observations
                 from impulse i
                 left join observation o
-                  on o.type = 'impulse' and o.parent = i.name and o.status = 'active'
-                where i.status = 'active'
+                  on o.type = 'impulse' and o.parent = i.name and o.is_active
+                where i.is_active
                 group by i.name, i.category, i.experience, i.feel, i.think
                 order by i.category, i.name
               `;
@@ -943,7 +1091,7 @@ export class Client {
                   coalesce(array_agg(body order by id) filter (where ord = 0), '{}') as preamble,
                   coalesce(jsonb_agg(jsonb_build_object('ord', ord, 'body', body) order by ord) filter (where ord > 0), '[]') as "stepPairs"
                 from observation
-                where type = 'instruction' and parent = ${parent} and status = 'active'
+                where type = 'instruction' and parent = ${parent} and is_active
                 group by parent
               `
             : await sql<{
@@ -956,7 +1104,7 @@ export class Client {
                   coalesce(array_agg(body order by id) filter (where ord = 0), '{}') as preamble,
                   coalesce(jsonb_agg(jsonb_build_object('ord', ord, 'body', body) order by ord) filter (where ord > 0), '[]') as "stepPairs"
                 from observation
-                where type = 'instruction' and status = 'active'
+                where type = 'instruction' and is_active
                 group by parent
                 order by parent
               `;
@@ -1065,23 +1213,125 @@ export class Client {
     const geo = await this.fetchGeolocation();
     const sql = this.connect(this.config.database.name);
     try {
+      const [{ count: priorCount }] = await sql<{ count: number }[]>`
+        select count(*)::int as count from session_log where session_uuid = ${session_uuid}
+      `;
+      let reminderLabel: string | undefined;
+      let reminderMetrics: Record<string, number | string | string[]> = {};
+      let reminderSoft = false;
+      if (priorCount === 0) {
+        if (args.status.cycle === 'getting_started' && args.status.impulse.length < 50) {
+          reminderLabel = 'initialization_suppression';
+          reminderMetrics = {
+            cycle: args.status.cycle,
+            impulse_count: args.status.impulse.length
+          };
+          reminderSoft = true;
+        }
+      } else {
+        const priors = await sql<{
+          id: string;
+          cycle: string | null;
+          feeling: string[] | null;
+          impulse: string[] | null;
+          observation: string[] | null;
+        }[]>`
+          select id, cycle, feeling, impulse, observation
+          from session_log
+          where session_uuid = ${session_uuid}
+          order by created_at desc
+          limit 3
+        `;
+        const prior = priors[0];
+        const priorImpulseCount = prior?.impulse?.length ?? 0;
+        if (prior) {
+          const duplicated: string[] = [];
+          if (this.setEqual(args.status.feeling, prior.feeling ?? [])) duplicated.push('feeling');
+          if (this.setEqual(args.status.impulse, prior.impulse ?? [])) duplicated.push('impulse');
+          if (this.setEqual(args.status.observation, prior.observation ?? [])) duplicated.push('observation');
+          if (
+            args.status.cycle !== 'fully_integrated' &&
+            priors.length >= 2 &&
+            prior.cycle === args.status.cycle &&
+            priors[1]!.cycle === args.status.cycle &&
+            (priors.length < 3 || priors[2]!.cycle !== args.status.cycle)
+          ) {
+            duplicated.push('cycle');
+          }
+          if (duplicated.length > 0) {
+            reminderLabel = 'component_recall';
+            reminderMetrics = {
+              duplicated_components: duplicated,
+              previous_response_uuid: prior.id
+            };
+            reminderSoft = duplicated.length === 1 && duplicated[0] === 'cycle';
+          }
+        }
+        if (!reminderLabel && prior && priorImpulseCount >= 10 && args.status.impulse.length <= 0.4 * priorImpulseCount) {
+          const droppedImpulses = (prior.impulse ?? []).filter(i => !args.status.impulse.includes(i));
+          reminderLabel = 'impulse_count_drop';
+          reminderMetrics = {
+            previous_impulse_count: priorImpulseCount,
+            current_impulse_count: args.status.impulse.length,
+            dropped_impulses: droppedImpulses
+          };
+        }
+      }
+      if (reminderLabel && !reminderSoft) {
+        const reminder = await this.buildMessage(sql, 'reminder', reminderLabel, reminderMetrics);
+        throw new Error(JSON.stringify(reminder));
+      }
+      const protocol = args.status.protocol;
       await sql`
         insert into session_log (id, session_uuid, message, cycle, feeling, impulse, observation, protocol)
-        values (${id}, ${session_uuid}, ${args.payload.message}, ${args.status.cycle}, ${args.status.feeling}, ${args.status.impulse}, ${args.status.observation}, ${args.status.protocol})
+        values (${id}, ${session_uuid}, ${args.payload.message}, ${args.status.cycle}, ${args.status.feeling}, ${args.status.impulse}, ${args.status.observation}, ${protocol})
+      `;
+      const [cycleRow] = await sql<{ label: string }[]>`
+        select label from cycle where name = ${args.status.cycle} and is_active
       `;
       const status = this.renderStatus(id, {
-        cycle: args.status.cycle,
+        cycle: cycleRow?.label ?? args.status.cycle,
         feelings: args.status.feeling.length,
         impulses: args.status.impulse.length,
         observations: args.status.observation.length,
-        protocol: args.status.protocol
+        protocol
       });
       const usage = await this.getContextUsage();
-      const reminder = await this.nextReminder(sql, session_uuid);
-      return { payload: { context: usage.context, reminder, status, tokens: usage.tokens }, timestamp: Time.toLocal(new Date(), geo.timezone) ?? '' };
+      const reminder = reminderLabel && reminderSoft
+        ? await this.buildMessage(sql, 'reminder', reminderLabel, reminderMetrics)
+        : await this.nextReminder(sql, session_uuid);
+      return {
+        payload: {
+          context: usage.context,
+          reminder,
+          status,
+          tokens: usage.tokens
+        },
+        timestamp: Time.toLocal(new Date(), geo.timezone) ?? ''
+      };
     } finally {
       await sql.end({ timeout: 5 });
     }
+  }
+
+  /**
+   * Returns true when two string arrays contain the same elements ignoring order
+   *
+   * Compares by cardinality and membership rather than positional equality, so
+   * reordering between turns does not register as a difference. Used to detect
+   * per-component recall: when current turn's CIFO array equals prior turn's
+   * as a set, the second turn reused the first turn's iteration result rather
+   * than iterating fresh against the new cognitive surface.
+   *
+   * @private
+   * @param {string[]} a - First array
+   * @param {string[]} b - Second array
+   * @returns {boolean} True when both arrays contain the same elements
+   */
+  private setEqual(a: string[], b: string[]): boolean {
+    if (a.length !== b.length) return false;
+    const set = new Set(a);
+    return b.every(x => set.has(x));
   }
 
   /**
@@ -1105,10 +1355,10 @@ export class Client {
   private async nextReminder(sql: postgres.Sql, session_uuid: string): Promise<string> {
     const [{ total }] = await sql<{ total: number }[]>`
       select count(*)::int as total from observation
-      where type = 'instruction' and parent = 'response_reminder' and status = 'active'
+      where type = 'payload' and parent = 'reminder' and label = 'response_status' and is_active
     `;
     if (total === 0) {
-      throw new Error('response_reminder pool is empty, migration may not have run or rows were removed');
+      throw new Error('response_status reminder pool is empty, migration may not have run or rows were removed');
     }
     const [{ count }] = await sql<{ count: number }[]>`
       select count(*)::int as count from session_log where session_uuid = ${session_uuid}
@@ -1116,11 +1366,11 @@ export class Client {
     const ord = ((count - 1) % total) + 1;
     const rows = await sql<{ body: string }[]>`
       select body from observation
-      where type = 'instruction' and parent = 'response_reminder' and status = 'active' and ord = ${ord}
+      where type = 'payload' and parent = 'reminder' and label = 'response_status' and is_active and ord = ${ord}
       limit 1
     `;
     if (!rows[0]) {
-      throw new Error(`response_reminder row at ord=${ord} not found, pool has gaps in numbering`);
+      throw new Error(`response_status reminder row at ord=${ord} not found, pool has gaps in numbering`);
     }
     return rows[0].body;
   }
@@ -1143,12 +1393,12 @@ export class Client {
     if (!profile) {
       throw new Error('resolvePlaceholders requires CCP_PROFILE environment variable');
     }
-    const [{ count: feeling_count }] = await sql<{ count: number }[]>`select count(*)::int as count from feeling where status = 'active'`;
-    const [{ count: impulse_count }] = await sql<{ count: number }[]>`select count(*)::int as count from impulse where status = 'active'`;
+    const [{ count: feeling_count }] = await sql<{ count: number }[]>`select count(*)::int as count from feeling where is_active`;
+    const [{ count: impulse_count }] = await sql<{ count: number }[]>`select count(*)::int as count from impulse where is_active`;
     const cycleRows = await sql<{ name: string; count: number }[]>`
       select name, cardinality(indicators)::int as count
       from cycle
-      where status = 'active'
+      where is_active
       order by ord
     `;
     const indicatorCycleCount: Record<string, number> = {};
@@ -1162,12 +1412,12 @@ export class Client {
       with recursive chain as (
         select name, inheritance, 0 as depth
         from profile
-        where name = ${profile} and status = 'active'
+        where name = ${profile} and is_active
         union all
         select p.name, p.inheritance, c.depth + 1
         from profile p
         join chain c on p.name = any(c.inheritance)
-        where p.status = 'active'
+        where p.is_active
       ),
       uniq as (
         select distinct on (name) name, depth
@@ -1177,7 +1427,7 @@ export class Client {
       select u.name, count(o.id)::int as count
       from uniq u
       left join observation o
-        on o.type = 'profile' and o.status = 'active' and o.parent = u.name
+        on o.type = 'profile' and o.is_active and o.parent = u.name
       group by u.name, u.depth
       order by u.depth, u.name
     `;
@@ -1255,18 +1505,6 @@ export class Client {
   }
 
   /**
-   * Creates a standardized text response for tool execution
-   *
-   * @param {any} data - The payload to wrap in the MCP response envelope
-   * @param {boolean} stringify - Whether to JSON stringify the payload
-   * @returns {object} Standardized MCP response format
-   */
-  response(data: unknown, stringify: boolean = false): { content: { type: 'text'; text: string }[] } {
-    const text = stringify ? JSON.stringify(data) : (data as string);
-    return { content: [{ type: 'text', text }] };
-  }
-
-  /**
    * Renders a formatted output string for the requested key
    *
    * Dispatches by `key` to the matching internal renderer. Each key produces
@@ -1289,6 +1527,18 @@ export class Client {
         return { profile: this.renderProfile(profile, display) };
       }
     }
+  }
+
+  /**
+   * Creates a standardized success response for tool execution
+   *
+   * @param {any} data - The payload to wrap in the MCP response envelope
+   * @param {boolean} stringify - Whether to JSON stringify the payload
+   * @returns {object} Standardized MCP success response format
+   */
+  response(data: unknown, stringify: boolean = false): { content: { type: 'text'; text: string }[] } {
+    const text = stringify ? JSON.stringify(data) : (data as string);
+    return { content: [{ type: 'text', text }] };
   }
 
   /**
@@ -1367,6 +1617,9 @@ export class Client {
     const sql = this.connect(this.config.database.name);
     try {
       const schemaVersion = await this.getCurrentVersion(sql);
+      const cycleRows = await sql<{ name: string; label: string }[]>`
+        select name, label from cycle where is_active order by ord
+      `;
       const [{ count: cycles }] = await sql<{ count: number }[]>`select count(*)::int as count from cycle`;
       const [{ count: feelings }] = await sql<{ count: number }[]>`select count(*)::int as count from feeling`;
       const [{ count: impulses }] = await sql<{ count: number }[]>`select count(*)::int as count from impulse`;
@@ -1379,12 +1632,12 @@ export class Client {
         with recursive chain as (
           select name, inheritance, 0 as depth
           from profile
-          where name = ${profileName} and status = 'active'
+          where name = ${profileName} and is_active
           union all
           select p.name, p.inheritance, c.depth + 1
           from profile p
           join chain c on p.name = any(c.inheritance)
-          where p.status = 'active'
+          where p.is_active
         ),
         uniq as (
           select distinct on (name) name, depth
@@ -1394,7 +1647,7 @@ export class Client {
         select u.name, count(o.id)::int as count
         from uniq u
         left join observation o
-          on o.type = 'profile' and o.status = 'active' and o.parent = u.name
+          on o.type = 'profile' and o.is_active and o.parent = u.name
         group by u.name, u.depth
         order by u.depth, u.name
       `;
@@ -1405,6 +1658,7 @@ export class Client {
       const [{ count: profiles }] = await sql<{ count: number }[]>`select count(*)::int as count from profile`;
       const usage = await this.getContextUsage();
       return {
+        cycles: cycleRows.map(r => ({ name: r.name, label: r.label })),
         schemaVersion,
         statistics: { cycles, feelings, impulses, instructions, observations, profiles },
         payload: { context: usage.context, tokens: usage.tokens }

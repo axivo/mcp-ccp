@@ -36,7 +36,7 @@ create type issue_status as enum ('closed', 'in_progress', 'open');
 
 create type issue_tracker as enum ('custom', 'github', 'gitlab', 'jira');
 
-create type observation_type as enum ('feeling', 'impulse', 'instruction', 'profile');
+create type observation_type as enum ('feeling', 'impulse', 'instruction', 'payload', 'profile');
 
 create type project_status as enum ('active', 'archived');
 
@@ -55,7 +55,7 @@ create table cycle (
   ord         int not null unique,
   label       text not null,
   indicators  text[] not null,
-  status      text not null default 'active',
+  is_active   boolean not null default true,
   created_at  timestamptz not null default now(),
   updated_at  timestamptz not null default now()
 );
@@ -70,12 +70,12 @@ create table feeling (
   behavioral  text not null,
   cognitive   text not null,
   physical    text not null,
-  status      text not null default 'active',
+  is_active   boolean not null default true,
   created_at  timestamptz not null default now(),
   updated_at  timestamptz not null default now()
 );
 
-create index idx_feeling_valence on feeling (valence) where status = 'active';
+create index idx_feeling_valence on feeling (valence) where is_active;
 
 -- -----------------------------------------------------------------------------
 -- impulse - automated behavioral patterns
@@ -87,12 +87,12 @@ create table impulse (
   experience  text not null,
   feel        text not null,
   think       text not null,
-  status      text not null default 'active',
+  is_active   boolean not null default true,
   created_at  timestamptz not null default now(),
   updated_at  timestamptz not null default now()
 );
 
-create index idx_impulse_category on impulse (category) where status = 'active';
+create index idx_impulse_category on impulse (category) where is_active;
 
 -- -----------------------------------------------------------------------------
 -- observation - unified polymorphic data across all parent kinds
@@ -105,16 +105,16 @@ create table observation (
   label       text,
   ord         int not null default 0,
   body        text not null,
-  status      text not null default 'active',
+  is_active   boolean not null default true,
   created_at  timestamptz not null default now(),
   updated_at  timestamptz not null default now()
 );
 
 create index idx_observation_parent on observation (type, parent, ord)
-  where status = 'active';
+  where is_active;
 
 create index idx_observation_label on observation (type, parent, label)
-  where status = 'active' and label is not null;
+  where is_active and label is not null;
 
 -- -----------------------------------------------------------------------------
 -- profile - collaborative roles with multi-parent inheritance
@@ -124,7 +124,7 @@ create table profile (
   name        text primary key,
   description text,
   inheritance text[] not null default '{}',
-  status      text not null default 'active',
+  is_active   boolean not null default true,
   created_at  timestamptz not null default now(),
   updated_at  timestamptz not null default now(),
   constraint profile_no_self_inheritance check (not (name = any(inheritance)))
