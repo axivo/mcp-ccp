@@ -112,11 +112,14 @@ create table observation (
   updated_at  timestamptz not null default now()
 );
 
-create index idx_observation_parent on observation (type, parent, ord)
+create index idx_observation_body on observation (type, body)
   where is_active;
 
 create index idx_observation_label on observation (type, parent, label)
   where is_active and label is not null;
+
+create index idx_observation_parent on observation (type, parent, ord)
+  where is_active;
 
 -- -----------------------------------------------------------------------------
 -- profile - collaborative roles with multi-parent inheritance

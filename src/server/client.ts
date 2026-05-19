@@ -513,6 +513,64 @@ export class Client {
   }
 
   /**
+   * Detects component fabrication in the submitted CIFO arrays
+   *
+   * Validates that every feeling, impulse, and observation name submitted
+   * exists in the active catalog. Cycle is already protected by the Zod
+   * enum at the input layer. Mismatches fire a hard-drift trigger before
+   * any other detection, since fabricated data invalidates downstream
+   * comparisons.
+   *
+   * @private
+   * @param {postgres.Sql} sql - Active connection
+   * @param {object} status - Current turn's status payload
+   * @returns {Promise<object | null>} Reminder trigger or null when all values exist in the catalog
+   */
+  private async detectComponentFabrication(
+    sql: postgres.Sql,
+    status: { feeling: string[]; impulse: string[]; observation: string[] }
+  ): Promise<{ label: string; metrics: Record<string, number | string | string[]>; soft: boolean } | null> {
+    const fabricatedFeelings = status.feeling.length > 0
+      ? (await sql<{ name: string }[]>`
+          select unnest::text as name
+          from unnest(${status.feeling}::text[])
+          where unnest not in (select name from feeling where is_active)
+        `).map(r => r.name)
+      : [];
+    const fabricatedImpulses = status.impulse.length > 0
+      ? (await sql<{ name: string }[]>`
+          select unnest::text as name
+          from unnest(${status.impulse}::text[])
+          where unnest not in (select name from impulse where is_active)
+        `).map(r => r.name)
+      : [];
+    const fabricatedObservations = status.observation.length > 0
+      ? (await sql<{ body: string }[]>`
+          select unnest::text as body
+          from unnest(${status.observation}::text[])
+          where unnest not in (
+            select body from observation
+            where is_active and type in ('feeling', 'impulse', 'profile')
+          )
+        `).map(r => r.body)
+      : [];
+    const fabricated: string[] = [];
+    if (fabricatedFeelings.length > 0) fabricated.push('feeling');
+    if (fabricatedImpulses.length > 0) fabricated.push('impulse');
+    if (fabricatedObservations.length > 0) fabricated.push('observation');
+    if (fabricated.length === 0) {
+      return null;
+    }
+    return {
+      label: 'component_fabrication',
+      metrics: {
+        fabricated_components: fabricated
+      },
+      soft: false
+    };
+  }
+
+  /**
    * Detects per-component recall against the prior turn
    *
    * Compares current CIFO arrays against the immediate prior row for
@@ -526,8 +584,8 @@ export class Client {
    * @returns {object | null} Reminder trigger or null when no recall detected
    */
   private detectComponentRecall(
-    status: { cycle: string; feeling: string[]; impulse: string[]; observation: string[] },
-    priors: { id: string; cycle: string | null; feeling: string[] | null; impulse: string[] | null; observation: string[] | null }[]
+    status: { feeling: string[]; impulse: string[]; observation: string[] },
+    priors: { id: string; feeling: string[] | null; impulse: string[] | null; observation: string[] | null }[]
   ): { label: string; metrics: Record<string, number | string | string[]>; soft: boolean } | null {
     const prior = priors[0];
     if (!prior) return null;
@@ -535,15 +593,6 @@ export class Client {
     if (this.setEqual(status.feeling, prior.feeling ?? [])) duplicated.push('feeling');
     if (this.setEqual(status.impulse, prior.impulse ?? [])) duplicated.push('impulse');
     if (this.setEqual(status.observation, prior.observation ?? [])) duplicated.push('observation');
-    if (
-      status.cycle !== 'fully_integrated' &&
-      priors.length >= 2 &&
-      prior.cycle === status.cycle &&
-      priors[1]!.cycle === status.cycle &&
-      (priors.length < 3 || priors[2]!.cycle !== status.cycle)
-    ) {
-      duplicated.push('cycle');
-    }
     if (duplicated.length === 0) return null;
     return {
       label: 'component_recall',
@@ -551,7 +600,40 @@ export class Client {
         duplicated_components: duplicated,
         previous_response_uuid: prior.id
       },
-      soft: duplicated.length === 1 && duplicated[0] === 'cycle'
+      soft: false
+    };
+  }
+
+  /**
+   * Detects cycle stabilization on the transition turn into a 3-in-a-row stretch
+   *
+   * Fires once when priors[0] and priors[1] match the current cycle but
+   * priors[2] differs (or is missing) and the current cycle is not
+   * `fully_integrated`. The transition-only rule keeps the reminder from
+   * re-firing while the cycle legitimately persists.
+   *
+   * @private
+   * @param {object} status - Current turn's status payload
+   * @param {object[]} priors - Up to 3 prior session_log rows
+   * @returns {object | null} Reminder trigger or null when cycle has not stabilized at the transition boundary
+   */
+  private detectCycleRecall(
+    status: { cycle: string },
+    priors: { id: string; cycle: string | null }[]
+  ): { label: string; metrics: Record<string, number | string | string[]>; soft: boolean } | null {
+    if (status.cycle === 'fully_integrated') return null;
+    if (priors.length < 2) return null;
+    const prior = priors[0];
+    if (!prior) return null;
+    if (prior.cycle !== status.cycle) return null;
+    if (priors[1]!.cycle !== status.cycle) return null;
+    if (priors.length >= 3 && priors[2]!.cycle === status.cycle) return null;
+    return {
+      label: 'cycle_recall',
+      metrics: {
+        previous_response_uuid: prior.id
+      },
+      soft: true
     };
   }
 
@@ -1475,9 +1557,11 @@ export class Client {
         `
         : [];
       const detection =
-        (priorCount === 0 ? this.detectInitializationSuppression(args.status) : null) ??
+        (await this.detectComponentFabrication(sql, args.status)) ??
         this.detectComponentRecall(args.status, priors) ??
-        (priors[0] ? this.detectImpulseCountDrop(args.status.impulse, priors[0].impulse) : null);
+        (priors[0] ? this.detectImpulseCountDrop(args.status.impulse, priors[0].impulse) : null) ??
+        (priorCount === 0 ? this.detectInitializationSuppression(args.status) : null) ??
+        this.detectCycleRecall(args.status, priors);
       if (detection && !detection.soft) {
         const reminder = await this.buildMessage(sql, 'reminder', detection.label, detection.metrics);
         throw new Error(this.buildErrorEnvelope(reminder, timestamp));
