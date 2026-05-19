@@ -1,6 +1,6 @@
 {
   "name": "@axivo/mcp-ccp",
-  "version": "0.1.0",
+  "version": "1.0.0",
   "type": "module",
   "description": "MCP server for the Claude Collaboration Platform",
   "keywords": [
@@ -34,11 +34,16 @@
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.29.0",
+    "@mozilla/readability": "^0.6.0",
+    "jsdom": "^29.1.1",
     "postgres": "^3.4.0",
+    "turndown": "^7.2.4",
     "zod": "^4.4.0"
   },
   "devDependencies": {
+    "@types/jsdom": "^28.0.3",
     "@types/node": "^25.0.0",
+    "@types/turndown": "^5.0.6",
     "typescript": "^6.0.0"
   },
   "engines": {

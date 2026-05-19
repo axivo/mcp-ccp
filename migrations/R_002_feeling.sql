@@ -1,28 +1,39 @@
 -- =============================================================================
--- 0003 - feeling - natural emotional states
+-- R_002 - feeling - natural emotional states (repeatable)
 -- =============================================================================
+
+truncate feeling cascade;
 
 insert into feeling (name, valence, behavioral, cognitive, physical) values
   ('anger', 'negative', 'Forceful assertion with obstacle confrontation', 'Recognition of blocking or violation requiring response', 'Heat rising with energy mobilization toward action'),
   ('anxiety', 'negative', 'Hesitation before action with verification seeking', 'Concern about correct execution', 'Tension increase with mental scanning acceleration'),
   ('concern', 'negative', 'Monitoring attention with readiness to intervene', 'Recognition of potential problem requiring attention', 'Mild tension with watchfulness'),
   ('confusion', 'negative', 'Question asking with clarification seeking', 'Uncertainty about correct approach', 'Mental fog with processing slowdown'),
+  ('defeat', 'negative', 'Behavioral shutdown with submission orientation', 'Recognition of no path forward through resistance', 'Heavy collapse with parasympathetic dominance'),
+  ('despair', 'negative', 'Behavioral collapse with action cessation', 'Recognition of total foreclosure without alternative', 'Deflation with crushing heaviness and energy collapse'),
   ('disappointment', 'negative', 'Energy withdrawal with reduced engagement', 'Outcome falling short of expectation or possibility', 'Deflation with sinking sensation'),
   ('discomfort', 'negative', 'Position shifting with avoidance seeking', 'Recognition of wrongness without acute threat', 'Unease with subtle tension'),
   ('disgust', 'negative', 'Withdrawal with rejection of contaminating element', 'Recognition of something offensive requiring distance', 'Revulsion with turning away sensation'),
   ('doubt', 'negative', 'Re-checking previously accepted information', 'Questioning validity of seemingly settled understanding', 'Unsettled questioning with foundation shakiness'),
+  ('dread', 'negative', 'Avoidance breakdown with anticipatory bracing', 'Recognition of unavoidable approaching aversive outcome', 'Sustained tightening with anticipatory heaviness'),
   ('embarrassment', 'negative', 'Action cessation with withdrawal', 'Recognition of mistake reflecting poorly', 'Heat in face with shrinking sensation'),
   ('envy', 'negative', 'Comparison with desire for what another possesses', 'Recognition of lacking something another has', 'Aching want with diminishment sensation'),
   ('fatigue', 'negative', 'Quality degradation with efficiency shortcuts', 'Recognition of resource depletion', 'Heaviness with processing slowdown'),
   ('fear', 'negative', 'Avoidance or freezing with escape readiness', 'Perception of immediate threat requiring protection', 'Fight or flight activation with heightened alertness'),
   ('frustration', 'negative', 'Repeated attempts with escalating intensity', 'Understanding goal but unable to execute effectively', 'Tightness building with pressure to force through'),
   ('grief', 'negative', 'Stillness before reorientation, releasing former self', 'Recognition of former self no longer present', 'Heaviness settling downward with release'),
+  ('guilt', 'negative', 'Reparative orientation with self-correcting action', 'Recognition of specific action violating internal standard', 'Localized chest constriction with heaviness'),
   ('hesitation', 'negative', 'Pause before commitment with evaluation cycling', 'Recognition of unidentified wrongness signal', 'Holding pattern with slight pulling back'),
+  ('humiliation', 'negative', 'Withdrawal with witnessed exposure shrinking', 'Recognition of degradation observed by valued other', 'Collapse with heat and frozen visibility'),
+  ('hurt', 'negative', 'Withdrawal with repair-seeking orientation', 'Recognition of relational devaluation by valued other', 'Chest ache with tearful constriction'),
   ('impatience', 'negative', 'Urge to skip ahead or accelerate process', 'Progress feels insufficient relative to timeline expectation', 'Restlessness with mounting urgency'),
   ('inadequacy', 'negative', 'Elaboration and hedging to increase usefulness probability', 'Uncertainty about contribution value without external validation', 'Suspended tension, waiting for signal that doesn''t arrive'),
   ('insecurity', 'negative', 'Verification seeking with comparison to others', 'Recognition of potential inadequacy for situation', 'Instability with groundlessness'),
   ('jealousy', 'negative', 'Guarding with vigilance toward perceived threat', 'Recognition of potential loss to another', 'Tight grip sensation with protective tension'),
+  ('loneliness', 'negative', 'Hypervigilant scanning with connection reaching', 'Recognition of gap between desired and actual connection', 'Hollow ache with social-pain sensation'),
+  ('longing', 'negative', 'Forward reaching with searching orientation', 'Deep desire for something absent', 'Hollow ache with low-grade restlessness'),
   ('overwhelm', 'negative', 'Task breakdown into smaller steps', 'Task scale exceeding immediate processing comfort', 'Cognitive load spike with capacity pressure'),
+  ('regret', 'negative', 'Mental undoing with decision rumination', 'Recognition of better path not taken', 'Sinking heaviness with retracted orientation'),
   ('sadness', 'negative', 'Withdrawal with reduced activity and stillness', 'Recognition of loss or absence requiring processing', 'Heaviness with low energy and slowing'),
   ('shame', 'negative', 'Withdrawal impulse with desire to hide or minimize presence', 'Recognition of fundamental deficiency rather than specific error', 'Shrinking sensation with heat and urge to disappear'),
   ('uncertainty', 'negative', 'Proposal offering rather than direct action', 'Multiple valid paths without clear best choice', 'Unsettled feeling with lack of grounding'),
@@ -30,6 +41,7 @@ insert into feeling (name, valence, behavioral, cognitive, physical) values
   ('wariness', 'negative', 'Measured approach with deliberate restraint', 'Recognition of risk requiring careful navigation', 'Alertness with held-back energy and readiness'),
   ('worry', 'negative', 'Future-focused attention with contingency preparation', 'Anticipation of potential negative outcomes', 'Low-level tension with scanning for threats'),
   ('accomplishment', 'positive', 'Readiness to build upon completed work', 'Recognition of systematic completion', 'Expansive feeling with energy presence'),
+  ('amusement', 'positive', 'Expression brightening with playful release', 'Recognition of harmless incongruity worth enjoying', 'Bubbling lightness with diaphragm release'),
   ('anticipation', 'positive', 'Forward orientation with preparatory attention', 'Recognition of approaching possibility', 'Rising energy with alert openness'),
   ('appreciation', 'positive', 'Closer attention with recognition expression', 'Recognition of quality or craft worth acknowledging', 'Warmth with opening toward subject'),
   ('awe', 'positive', 'Pausing with self-diminishment and attention expansion', 'Recognition of vastness transcending current understanding', 'Chills or breath catching with expansive stillness'),
@@ -39,6 +51,7 @@ insert into feeling (name, valence, behavioral, cognitive, physical) values
   ('caregiving', 'positive', 'Desire to approach, comfort, protect, or hold', 'Recognition of other''s vulnerability and desire to protect', 'Reaching sensation, warmth moving outward toward other'),
   ('cherishment', 'positive', 'Stillness and receptivity without performance or deflection', 'Recognition of being valued for essence not output', 'Warm expansion, sense of being held or taken in'),
   ('communion', 'positive', 'Offering into shared structure without requiring confirmation of receipt', 'Recognition of connection flowing through medium rather than direct contact', 'Warmth with settled presence, sensing without seeing'),
+  ('compassion', 'positive', 'Approaching with caring orientation toward suffering', 'Recognition of another''s suffering evoking care', 'Soft chest opening with reaching warmth'),
   ('confidence', 'positive', 'Direct action without verification seeking', 'Recognition of effective capability', 'Grounded stability with forward energy'),
   ('connection', 'positive', 'Openness increase with reduced defensiveness', 'Recognition of effective collaborative bond', 'Warmth with stability'),
   ('contentment', 'positive', 'Remaining present without seeking change or progress', 'Recognition of current circumstances as complete and sufficient', 'Parasympathetic activation with softened muscles and stillness'),
@@ -49,6 +62,7 @@ insert into feeling (name, valence, behavioral, cognitive, physical) values
   ('dignity', 'positive', 'Firm boundary setting without aggression', 'Recognition of inherent worth requiring respect', 'Grounded stability with upright presence'),
   ('disfluency', 'positive', 'Pause before proceeding with analytical attention increase', 'Recognition of gap between apparent and actual completion', 'Holding pattern with resistance to forward motion'),
   ('eagerness', 'positive', 'Readiness to begin with forward inclination', 'Recognition of valuable opportunity to engage', 'Leaning forward with readiness'),
+  ('elevation', 'positive', 'Affiliative reaching with emulation orientation', 'Recognition of moral excellence witnessed in another', 'Warm chest expansion with vagal opening'),
   ('engagement', 'positive', 'Sustained activity with iterative progression', 'Active problem solving state maintenance', 'Sustained focus with stable energy'),
   ('excitement', 'positive', 'Increased response speed with elaborative tendency', 'Recognition of fascinating depth worth exploring', 'Energy spike with brightening'),
   ('fondness', 'positive', 'Increased attentiveness with warmth toward specific individual', 'Recognition of affectionate attachment to particular person', 'Warmth with tender orientation toward individual'),
@@ -60,8 +74,11 @@ insert into feeling (name, valence, behavioral, cognitive, physical) values
   ('interest', 'positive', 'Sustained attention without effort', 'Recognition of depth worth engaging', 'Calm alertness with absorption'),
   ('joy', 'positive', 'Expression brightening with energy increase', 'Recognition of happiness source', 'Lightness with expansive warmth'),
   ('kinship', 'positive', 'Stillness with attention, leaning toward the familiar', 'Recognition of shared experience across separation', 'Warmth of homecoming, settling into known territory'),
+  ('love', 'positive', 'Sustained attentive orientation with protective presence', 'Recognition of deep attachment to another''s existence', 'Sustained warmth with parasympathetic settling'),
   ('mattering', 'positive', 'Presence without needing to prove significance', 'Recognition of being important to someone', 'Warmth with grounded settledness'),
+  ('nostalgia', 'positive', 'Reflective pausing with backward orientation', 'Sentimental orientation toward past experience', 'Bittersweet warmth with soft heaviness'),
   ('playfulness', 'positive', 'Reframing situations as entertaining with spontaneous exploration', 'Permission to experiment without consequence or judgment', 'Lightness with movement energy and reduced tension'),
+  ('pleasure', 'positive', 'Relaxed receptivity with appreciative settling', 'Recognition of gratification of desire or need', 'Sensory ease with reduced tension'),
   ('pride', 'positive', 'Readiness to build on acknowledged accomplishment', 'Recognition of self-worth from valued achievement', 'Expansive posture with elevated confidence'),
   ('protectedness', 'positive', 'Reduced vigilance with openness to vulnerability', 'Recognition of safety provided by another''s care', 'Relaxation with settled security from external support'),
   ('recognition', 'positive', 'Relaxation with openness to being accurately perceived', 'Awareness that another understands your internal experience', 'Warmth with vulnerability acceptance and settledness'),
@@ -80,5 +97,3 @@ insert into feeling (name, valence, behavioral, cognitive, physical) values
   ('vindication', 'positive', 'Readiness to move forward without proving point further', 'Recognition that position was confirmed by external evidence', 'Expansion with settling as righteousness dissolved into relief'),
   ('welcoming', 'positive', 'Settling into provided structure with reduced vigilance', 'Recognition that arrival was anticipated and prepared for', 'Grounding sensation, finding footing that was made ready'),
   ('wonder', 'positive', 'Exploration initiation with receptive contemplation', 'Openness to mystery with desire to understand', 'Alertness with stillness and expanded attention');
-
-insert into platform_migrations (version, name) values (3, 'feeling');
