@@ -371,7 +371,7 @@ export class McpTool {
         usage: [
           'Call once at session start to learn the tool surface',
           'Each tool entry includes its `usage` array of directives',
-          'Read `upstream` for Anthropic upstream status summary'
+          'Read `upstream` for Anthropic systems status summary'
         ]
       }
     };
