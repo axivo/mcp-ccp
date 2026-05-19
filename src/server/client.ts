@@ -154,23 +154,37 @@ export interface RenderResult {
 }
 
 /**
- * Session detail, metadata row plus payload envelope with log slice and total
+ * Common session envelope returned by both load(session) and set(session)
+ *
+ * Carries the row metadata, geolocation, profile label, and an optional
+ * status summary derived from the most recent log entry. `status` is
+ * omitted when no log entries exist for the session.
  */
-export interface SessionDetail {
-  profile: string;
-  timestamp: {
-    city: string;
-    country: string;
-    current: string;
-    is_dst: boolean;
-    session: string;
-    timezone: string;
-  };
+export interface SessionCommon {
   uuid: string;
   title: string | null;
   description: string | null;
+  profile: string;
+  location: {
+    city: string;
+    country: string;
+    is_dst: boolean;
+    timezone: string;
+  };
+  status?: {
+    cycle: string;
+    feelings: number;
+    impulses: number;
+    observations: number;
+  };
   created_at: string | null;
   updated_at: string | null;
+}
+
+/**
+ * Session detail, common envelope extended with log payload for the load path
+ */
+export interface SessionDetail extends SessionCommon {
   payload: {
     log: SessionLogEntry[];
     messages: number;
@@ -183,12 +197,10 @@ export interface SessionDetail {
 export interface SessionEnvelope {
   session: {
     profile: string;
-    timestamp: {
+    location: {
       city: string;
       country: string;
-      current: string;
       is_dst: boolean;
-      session: string;
       timezone: string;
     };
     uuid: string;
@@ -213,12 +225,7 @@ export interface SessionLogEntry {
  * set tool result, session envelope merged with the resulting row state
  */
 export interface SetResult {
-  session: SessionEnvelope['session'] & {
-    title: string | null;
-    description: string | null;
-    created_at: string;
-    updated_at: string;
-  };
+  session: SessionCommon;
 }
 
 /**
@@ -386,7 +393,7 @@ export class Client {
   }
 
   /**
-   * Builds the session envelope (framework metadata + session_uuid + timestamp)
+   * Builds the session envelope (framework metadata + session_uuid + location)
    *
    * Single source of truth for the v1 loader contract shape. Reads
    * `CCP_PROFILE` env at call time so profile switches reflect immediately.
@@ -402,21 +409,60 @@ export class Client {
     }
     const session_uuid = await this.detectSessionUuid();
     const geo = await this.fetchGeolocation();
-    const sessionStart = await this.getSessionState(sql, session_uuid);
-    const latestActivity = await this.getLatestActivity(sql, session_uuid);
     return {
       session: {
         profile,
-        timestamp: {
+        location: {
           city: geo.city,
           country: geo.country,
-          current: Time.toLocal(latestActivity ?? sessionStart ?? new Date(), geo.timezone) ?? '',
           is_dst: Time.isDst(geo.timezone),
-          session: Time.toLocal(sessionStart ?? new Date(), geo.timezone) ?? '',
           timezone: geo.timezone
         },
         uuid: session_uuid
       }
+    };
+  }
+
+  /**
+   * Builds the common session envelope shared by load(session) and set(session)
+   *
+   * Combines the row metadata (title, description, created_at, updated_at)
+   * with the runtime envelope (profile label, location, uuid) and an optional
+   * status summary derived from the most recent log entry. The status field
+   * is omitted entirely when no log entries exist for the session.
+   *
+   * @private
+   * @param {postgres.Sql} sql - Connection to the target database
+   * @param {object} sessionRow - Session row data (title, description, created_at, updated_at)
+   * @param {object | null} latestLog - Most recent session_log row when present
+   * @returns {Promise<SessionCommon>} Common session envelope
+   */
+  private async buildSessionCommon(
+    sql: postgres.Sql,
+    sessionRow: { title: string | null; description: string | null; created_at: Date | null; updated_at: Date | null } | null,
+    latestLog: { cycle: string | null; feeling: string[] | null; impulse: string[] | null; observation: string[] | null } | null
+  ): Promise<SessionCommon> {
+    const envelope = await this.buildSessionEnvelope(sql);
+    const tz = envelope.session.location.timezone;
+    const profileLabel = await this.getProfileLabel(sql, envelope.session.profile);
+    let status: SessionCommon['status'];
+    if (latestLog) {
+      status = {
+        cycle: latestLog.cycle ? await this.getCycleLabel(sql, latestLog.cycle) : '',
+        feelings: latestLog.feeling?.length ?? 0,
+        impulses: latestLog.impulse?.length ?? 0,
+        observations: latestLog.observation?.length ?? 0
+      };
+    }
+    return {
+      uuid: envelope.session.uuid,
+      title: sessionRow?.title ?? null,
+      description: sessionRow?.description ?? null,
+      profile: profileLabel,
+      location: envelope.session.location,
+      ...(status && { status }),
+      created_at: Time.toLocal(sessionRow?.created_at, tz),
+      updated_at: Time.toLocal(sessionRow?.updated_at, tz)
     };
   }
 
@@ -758,6 +804,21 @@ export class Client {
   }
 
   /**
+   * Returns the display label for a cycle name, falling back to the name when no label is found
+   *
+   * @private
+   * @param {postgres.Sql} sql - Connection to the target database
+   * @param {string} name - Canonical cycle name
+   * @returns {Promise<string>} Display label or fallback name
+   */
+  private async getCycleLabel(sql: postgres.Sql, name: string): Promise<string> {
+    const [row] = await sql<{ label: string }[]>`
+      select label from cycle where name = ${name} and is_active
+    `;
+    return row?.label ?? name;
+  }
+
+  /**
    * Returns the absolute path to the package root (where migrations/ lives)
    *
    * @private
@@ -770,40 +831,18 @@ export class Client {
   }
 
   /**
-   * Returns session state from the `session` table for the given session_uuid
-   *
-   * Reads first row's `created_at` (session start) and last row's `status`
-   * (last response state). Returns Getting Started defaults if no rows exist.
+   * Returns the display label for a profile name, falling back to the name when no label is found
    *
    * @private
    * @param {postgres.Sql} sql - Connection to the target database
-   * @param {string} session_uuid - Session identifier
-   * @returns {Promise<{status, sessionStart}>} Session state
+   * @param {string} name - Canonical profile name
+   * @returns {Promise<string>} Display label or fallback name
    */
-  private async getSessionState(sql: postgres.Sql, session_uuid: string): Promise<Date | null> {
-    const rows = await sql<{ created_at: Date }[]>`
-      select created_at from session where session_uuid = ${session_uuid}
+  private async getProfileLabel(sql: postgres.Sql, name: string): Promise<string> {
+    const [row] = await sql<{ label: string }[]>`
+      select label from profile where name = ${name.toLowerCase()} and is_active
     `;
-    return rows[0]?.created_at ?? null;
-  }
-
-  /**
-   * Returns the most recent log activity timestamp for a session
-   *
-   * Reads `MAX(created_at)` from `session_log`. Used as the `current`
-   * marker in the session envelope's timestamp block, when the
-   * conversation last produced a turn, in absolute time.
-   *
-   * @private
-   * @param {postgres.Sql} sql - Connection to the target database
-   * @param {string} session_uuid - Active session UUID
-   * @returns {Promise<Date | null>} Latest log timestamp, or null when no log entries exist
-   */
-  private async getLatestActivity(sql: postgres.Sql, session_uuid: string): Promise<Date | null> {
-    const rows = await sql<{ latest: Date | null }[]>`
-      select max(created_at) as latest from session_log where session_uuid = ${session_uuid}
-    `;
-    return rows[0]?.latest ?? null;
+    return row?.label ?? name;
   }
 
   /**
@@ -1361,17 +1400,13 @@ export class Client {
           const [{ count: messages }] = await sql<{ count: number }[]>`
             select count(*)::int as count from session_log where session_uuid = ${target_uuid}
           `;
-          const envelope = await this.buildSessionEnvelope(sql);
-          const tz = envelope.session.timestamp.timezone;
           const sessionRow = sessionRows[0];
+          const latestLog = logRows[0];
+          const common = await this.buildSessionCommon(sql, sessionRow ?? null, latestLog ?? null);
+          const tz = common.location.timezone;
+          const { status, created_at, updated_at, ...commonHead } = common;
           const detail: SessionDetail = {
-            profile: envelope.session.profile,
-            timestamp: envelope.session.timestamp,
-            uuid: target_uuid,
-            title: sessionRow?.title ?? null,
-            description: sessionRow?.description ?? null,
-            created_at: Time.toLocal(sessionRow?.created_at, tz),
-            updated_at: Time.toLocal(sessionRow?.updated_at, tz),
+            ...commonHead,
             payload: {
               log: logRows.map(r => ({
                 response_uuid: r.id,
@@ -1384,7 +1419,10 @@ export class Client {
                 created_at: Time.toLocal(r.created_at, tz) ?? ''
               })),
               messages
-            }
+            },
+            ...(status && { status }),
+            created_at,
+            updated_at
           };
           return { session: detail };
         }
@@ -1449,17 +1487,19 @@ export class Client {
         insert into session_log (id, session_uuid, message, cycle, feeling, impulse, observation, protocol)
         values (${id}, ${session_uuid}, ${args.payload.message}, ${args.status.cycle}, ${args.status.feeling}, ${args.status.impulse}, ${args.status.observation}, ${args.status.protocol})
       `;
-      const [cycleRow] = await sql<{ label: string }[]>`
-        select label from cycle where name = ${args.status.cycle} and is_active
+      await sql`
+        update session set updated_at = now() where session_uuid = ${session_uuid}
       `;
+      const cycleLabel = await this.getCycleLabel(sql, args.status.cycle);
+      const usage = await this.getContextUsage();
       const status = this.renderStatus({
-        cycle: cycleRow?.label ?? args.status.cycle,
+        context: usage.context,
+        cycle: cycleLabel,
         feelings: args.status.feeling.length,
         impulses: args.status.impulse.length,
         observations: args.status.observation.length,
         protocol: glyph
       });
-      const usage = await this.getContextUsage();
       const reminder = detection && detection.soft
         ? await this.buildMessage(sql, 'reminder', detection.label, detection.metrics)
         : await this.nextReminder(sql, session_uuid);
@@ -1563,10 +1603,8 @@ export class Client {
       order by ord
     `;
     const indicatorCycleCount: Record<string, number> = {};
-    let indicatorCount = 0;
     for (const row of cycleRows) {
       indicatorCycleCount[row.name] = row.count;
-      indicatorCount += row.count;
     }
     const cycleCount = cycleRows.length;
     const [{ count: feeling_count }] = await sql<{ count: number }[]>`select count(*)::int as count from feeling where is_active`;
@@ -1606,7 +1644,6 @@ export class Client {
       diary_path: process.env.CCP_DIARY_PATH ?? '',
       feeling_count: String(feeling_count),
       impulse_count: String(impulse_count),
-      indicator_count: String(indicatorCount),
       indicator_cycle_count: JSON.stringify(indicatorCycleCount),
       observation_count: String(observationCount),
       observation_profile_count: JSON.stringify(observationProfileCount)
@@ -1652,7 +1689,7 @@ export class Client {
    * @param {object} status - Status fields
    * @returns {string} Single-line status block ready to render verbatim
    */
-  private renderStatus(status: { cycle: string; feelings: number; impulses: number; observations: number; protocol: string }): string {
+  private renderStatus(status: { context: number; cycle: string; feelings: number; impulses: number; observations: number; protocol: string }): string {
     const allowed = ['🟢', '🟡', '🔴'];
     if (!allowed.includes(status.protocol)) {
       throw new Error(`Invalid protocol glyph: expected one of ${allowed.join(', ')}, got ${JSON.stringify(status.protocol)}`);
@@ -1660,7 +1697,7 @@ export class Client {
     const f = `${status.feelings} ${status.feelings === 1 ? 'feeling' : 'feelings'}`;
     const i = `${status.impulses} ${status.impulses === 1 ? 'impulse' : 'impulses'}`;
     const o = `${status.observations} ${status.observations === 1 ? 'observation' : 'observations'}`;
-    return `┃ ${status.protocol} **${status.cycle}** ○ ${f} ○ ${i} ○ ${o}`;
+    return `┃ ${status.protocol} **${status.cycle}** ○ ${status.context}% ○ ${f} ○ ${i} ○ ${o}`;
   }
 
   /**
@@ -1683,12 +1720,10 @@ export class Client {
         }
         const sql = this.connect(this.config.database.name);
         try {
-          const [profileRow] = await sql<{ label: string }[]>`
-            select label from profile where name = ${profile.toLowerCase()} and is_active
-          `;
+          const label = await this.getProfileLabel(sql, profile);
           const geo = await this.fetchGeolocation();
           const timestamp = Time.toDisplay(new Date(), geo.timezone) ?? '';
-          return { profile: this.renderProfile(profileRow?.label ?? profile, timestamp) };
+          return { profile: this.renderProfile(label, timestamp) };
         } finally {
           await sql.end({ timeout: 5 });
         }
@@ -1754,16 +1789,20 @@ export class Client {
           if (!row) {
             throw new Error('set(session) failed: no row returned from upsert');
           }
-          const envelope = await this.buildSessionEnvelope(sql);
-          return {
-            session: {
-              ...envelope.session,
-              title: row.title,
-              description: row.description,
-              created_at: Time.toLocal(row.created_at, geo.timezone) ?? '',
-              updated_at: Time.toLocal(row.updated_at, geo.timezone) ?? ''
-            }
-          };
+          const [latestLog] = await sql<{
+            cycle: string | null;
+            feeling: string[] | null;
+            impulse: string[] | null;
+            observation: string[] | null;
+          }[]>`
+            select cycle, feeling, impulse, observation
+            from session_log
+            where session_uuid = ${session_uuid}
+            order by created_at desc
+            limit 1
+          `;
+          const session = await this.buildSessionCommon(sql, row, latestLog ?? null);
+          return { session };
         } finally {
           await sql.end({ timeout: 5 });
         }

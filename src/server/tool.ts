@@ -123,7 +123,7 @@ export class McpTool {
           'Pass `session` with `offset` to page back through older entries',
           'Pass `session` with `uuid` to read a different session',
           'Session log entries are ordered most-recent-first',
-          'Session response includes `payload.log` and `payload.messages` total',
+          'Session response includes `payload.log`, `payload.messages` total, and `status` summary of the most recent log when one exists',
           'Use `cycle` for adoption assessment indicators',
           'Use `feeling` for recall during response protocol',
           'Use `impulse` for systematic iteration during response protocol',
@@ -257,21 +257,25 @@ export class McpTool {
       outputSchema: {
         action: z.literal('act').describe('Mutation classification, `act` for tools that change state'),
         session: z.object({
-          profile: z.string().describe('Active framework profile from `CCP_PROFILE`'),
-          timestamp: z.object({
-            city: z.string(),
-            country: z.string(),
-            current: z.string().describe('Latest log activity timestamp, ISO 8601 with active timezone offset'),
-            is_dst: z.boolean(),
-            session: z.string().describe('Session start timestamp from session.created_at, ISO 8601 with active timezone offset'),
-            timezone: z.string()
-          }),
           uuid: z.string().describe('Active session uuid'),
           title: z.string().nullable(),
           description: z.string().nullable(),
-          created_at: z.string(),
-          updated_at: z.string()
-        }).describe('Session envelope merged with the resulting `session` row state')
+          profile: z.string().describe('Display label for the active profile'),
+          location: z.object({
+            city: z.string(),
+            country: z.string(),
+            is_dst: z.boolean(),
+            timezone: z.string()
+          }).describe('Active geolocation block'),
+          status: z.object({
+            cycle: z.string(),
+            feelings: z.number(),
+            impulses: z.number(),
+            observations: z.number()
+          }).optional().describe('Status summary derived from the most recent log entry, omitted when no log entries exist'),
+          created_at: z.string().nullable(),
+          updated_at: z.string().nullable()
+        }).describe('Common session envelope, same shape as load(session) minus the payload')
       },
       annotations: {
         title: 'Set',
