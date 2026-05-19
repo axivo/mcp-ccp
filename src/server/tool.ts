@@ -43,7 +43,7 @@ export class McpTool {
    *
    * Fetches the URL, runs Mozilla Readability to extract the main content,
    * converts it to markdown via Turndown. Mirrors Firefox Reader View and
-   * Safari Reader. Stateless — no cookies, no caching, no session.
+   * Safari Reader. Stateless - no cookies, no caching, no session.
    */
   browse() {
     return {
@@ -156,7 +156,7 @@ export class McpTool {
           feeling: z.array(z.string()).describe('Detected feeling names from the catalog'),
           impulse: z.array(z.string()).describe('Detected impulse names from the catalog'),
           observation: z.array(z.string()).describe('Applied observation bodies that informed the response'),
-          protocol: z.record(z.string(), z.boolean()).describe('Step-by-step completion map keyed by response protocol step ord (e.g. {"1": true, "2": false, ...}), declaring whether each step was executed honestly this turn. Server derives the status glyph from the map values')
+          protocol: z.enum(['bypassed', 'partial', 'successful']).describe('Response protocol execution outcome collapsed from the sibling-internal step-completion map: `successful` when every step executed honestly, `bypassed` when every step skipped, `partial` otherwise. Server derives the status glyph from this value')
         }).describe('Protocol execution record built during the response protocol')
       },
       outputSchema: {
@@ -170,7 +170,7 @@ export class McpTool {
               steps: z.record(z.string(), z.string()).describe('Numbered guidance steps keyed by ord'),
               metrics: z.record(z.string(), z.union([z.string(), z.number(), z.array(z.string())])).describe('Trigger-specific evidence: scalar for single-value metrics, array for list-valued metrics')
             })
-          ]).describe('Guidance for this response. Default rotates through the `response_status` pool round-robin as a single-line string. When a soft drift trigger fires (cycle-only `component_recall`), the reminder is replaced with a structured `{preamble, steps, metrics}` body for that label. Hard drift triggers (list-component `component_recall`, `impulse_count_drop`, `initialization_suppression`) instead refuse the log call and throw an MCP error carrying the same structured body — the row is not persisted in that case.'),
+          ]).describe('Guidance for this response. Default rotates through the `response_status` pool round-robin as a single-line string. When a soft drift trigger fires (cycle-only `component_recall`), the reminder is replaced with a structured `{preamble, steps, metrics}` body for that label. Hard drift triggers (list-component `component_recall`, `impulse_count_drop`, `initialization_suppression`) instead refuse the log call and throw an MCP error carrying the same structured body - the row is not persisted in that case.'),
           status: z.string().describe('Two-line status block ready to render verbatim at end of response'),
           tokens: z.object({
             total: z.number().describe('Configured context window size in tokens'),
@@ -190,16 +190,15 @@ export class McpTool {
           'Call once per response after the response protocol iteration completes',
           'Compose `payload.message` as first-person brief note capturing what mattered this turn',
           'Do not call twice for the same response',
-          'Empty or incomplete `status.protocol` map triggers `response_protocol_recall` refusal',
           'On MCP error → Re-execute response protocol steps honestly and resubmit log',
           'On MCP error with structured `{preamble, steps, metrics}` → Row is not persisted',
-          'Pass `status.protocol` as a step-by-step completion map keyed by response protocol step ord',
+          'Pass `status.protocol` as the enum value collapsed from the sibling-internal step-completion map',
           'Pass applied `observation` bodies as a list',
           'Pass detected `feeling` and `impulse` names from catalogs as lists',
           'Read `payload.reminder` inward as internal framework guidance',
           'Render the returned `payload.status` field verbatim at end of response',
           'Server computes counts from list lengths and renders the status block',
-          'Server derives the status glyph from `status.protocol` map values (all true → ✅, mixed → ⚠️, all false → ⛔️)'
+          'Server derives the status glyph from `status.protocol` enum value (`successful` → ✅, `partial` → ⚠️, `bypassed` → ⛔️)'
         ]
       }
     };
@@ -334,7 +333,33 @@ export class McpTool {
           outputSchema: z.unknown().optional(),
           annotations: z.unknown().optional(),
           usage: z.array(z.string()).optional()
-        })).describe('All available tools with their schemas and usage guidance')
+        })).describe('All available tools with their schemas and usage guidance'),
+        upstream: z.union([
+          z.object({
+            incidents: z.array(z.object({
+              impact: z.string(),
+              name: z.string(),
+              status: z.string(),
+              url: z.string()
+            })).optional().describe('Active incidents with public status-page URLs, present only when populated'),
+            page: z.object({
+              name: z.string(),
+              updated_at: z.string(),
+              url: z.string()
+            }).describe('Status page metadata including last update timestamp'),
+            scheduled_maintenances: z.array(z.object({
+              impact: z.string(),
+              name: z.string(),
+              status: z.string(),
+              url: z.string()
+            })).optional().describe('Scheduled maintenance windows with public status-page URLs, present only when populated'),
+            status: z.object({
+              description: z.string().describe('Human-readable summary of overall platform status'),
+              indicator: z.enum(['critical', 'major', 'minor', 'none']).describe('Severity indicator from the status page')
+            }).describe('Global platform status signal')
+          }),
+          z.null()
+        ]).describe('Upstream platform health from status.claude.com, or null when the status page is unreachable')
       },
       annotations: {
         title: 'Status',
@@ -345,7 +370,8 @@ export class McpTool {
       _meta: {
         usage: [
           'Call once at session start to learn the tool surface',
-          'Each tool entry includes its `usage` array of directives'
+          'Each tool entry includes its `usage` array of directives',
+          'Read `upstream` for Anthropic upstream status'
         ]
       }
     };

@@ -141,7 +141,7 @@ export class Mcp {
    * @param {object} args - Tool arguments
    * @returns {Promise<any>} Tool execution response
    */
-  private async handleLog(args: { payload: { message: string }; status: { cycle: string; feeling: string[]; impulse: string[]; observation: string[]; protocol: Record<string, boolean> } }) {
+  private async handleLog(args: { payload: { message: string }; status: { cycle: string; feeling: string[]; impulse: string[]; observation: string[]; protocol: 'bypassed' | 'partial' | 'successful' } }) {
     try {
       const result = await this.client.log(args);
       return this.structured('log', result as unknown as Record<string, unknown>);
@@ -193,9 +193,9 @@ export class Mcp {
    */
   private async handleStatus() {
     try {
-      const { payload, ...database } = await this.client.status();
+      const { payload, upstream, ...database } = await this.client.status();
       const tools = this.getToolDefinitions();
-      return this.structured('status', { database, payload, tools });
+      return this.structured('status', { database, payload, tools, upstream });
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       return this.client.response(`status failed: ${message}`);
@@ -230,7 +230,7 @@ export class Mcp {
   private registerAll(): void {
     this.server.registerTool('browse', this.tool.browse(), (args) => this.handleBrowse(args as { url: string; mode?: 'raw' | 'read'; timeout?: number }));
     this.server.registerTool('load', this.tool.load(), (args) => this.handleLoad(args as { type: 'cycle' | 'feeling' | 'impulse' | 'instruction' | 'profile' | 'session'; parent?: string; limit?: number; offset?: number; uuid?: string }));
-    this.server.registerTool('log', this.tool.log(), (args) => this.handleLog(args as { payload: { message: string }; status: { cycle: string; feeling: string[]; impulse: string[]; observation: string[]; protocol: Record<string, boolean> } }));
+    this.server.registerTool('log', this.tool.log(), (args) => this.handleLog(args as { payload: { message: string }; status: { cycle: string; feeling: string[]; impulse: string[]; observation: string[]; protocol: 'bypassed' | 'partial' | 'successful' } }));
     this.server.registerTool('render', this.tool.render(), (args) => this.handleRender(args as { key: 'profile'; value?: string }));
     this.server.registerTool('set', this.tool.set(), (args) => this.handleSet(args as { key: 'session'; payload?: { title?: string; description?: string } }));
     this.server.registerTool('status', this.tool.status(), () => this.handleStatus());

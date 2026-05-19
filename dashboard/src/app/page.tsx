@@ -5,7 +5,7 @@
  */
 
 /**
- * Dashboard index — temporary placeholder.
+ * Dashboard index - temporary placeholder.
  *
  * @returns {JSX.Element}
  */

@@ -3,7 +3,7 @@
  *
  * Wraps the app in the Refine provider chain and the Ant Design
  * registry needed for SSR-friendly style extraction. The Refine
- * resources are intentionally empty here — they are added as
+ * resources are intentionally empty here - they are added as
  * resource pages land.
  */
 
@@ -15,7 +15,7 @@ import { ConfigProvider } from 'antd'
 import './globals.css'
 
 export const metadata = {
-  description: 'Claude Collaboration Platform — projects, tasks, conversations',
+  description: 'Claude Collaboration Platform - projects, tasks, conversations',
   title: 'CCP Dashboard'
 }
 

@@ -204,7 +204,7 @@ export interface SessionLogEntry {
   impulse: string[] | null;
   message: string;
   observation: string[] | null;
-  protocol: Record<string, boolean>;
+  protocol: 'bypassed' | 'partial' | 'successful';
   response_uuid: string;
 }
 
@@ -241,6 +241,23 @@ export interface StatusResult {
       used: number;
     };
   };
+  upstream: UpstreamStatus | null;
+}
+
+/**
+ * Upstream platform health snapshot from status.claude.com
+ *
+ * Mirrors the Anthropic status page summary endpoint shape. `page` carries
+ * the status page metadata (name, url, last update timestamp). `status`
+ * carries the global platform indicator. `incidents` and `scheduled_maintenances`
+ * appear only when populated, so their presence indicates something active
+ * worth following via the browse tool using the carried URL.
+ */
+export interface UpstreamStatus {
+  incidents?: { impact: string; name: string; status: string; url: string }[];
+  page: { name: string; updated_at: string; url: string };
+  scheduled_maintenances?: { impact: string; name: string; status: string; url: string }[];
+  status: { description: string; indicator: 'critical' | 'major' | 'minor' | 'none' };
 }
 
 /**
@@ -433,21 +450,19 @@ export class Client {
   }
 
   /**
-   * Derives the response status glyph from the per-step completion map
+   * Derives the response status glyph from the protocol enum value
    *
-   * Maps the three protocol-map states to their corresponding glyphs.
-   * Empty map and all-false both render `⛔️` since both represent
-   * catastrophic execution skip. All-true renders `✅`. Any mix renders `⚠️`.
+   * Maps the three enum values to their corresponding glyphs.
+   * `bypassed` renders `⛔️`, `partial` renders `⚠️`, `successful` renders `✅`.
    *
    * @private
-   * @param {Record<string, boolean>} protocol - Step-by-step completion map
+   * @param {'bypassed' | 'partial' | 'successful'} protocol - Response protocol enum value
    * @returns {'✅' | '⚠️' | '⛔️'} Status glyph for the response status block
    */
-  private deriveProtocolGlyph(protocol: Record<string, boolean>): '✅' | '⚠️' | '⛔️' {
-    const values = Object.values(protocol);
-    if (values.length === 0 || values.every(v => !v)) return '⛔️';
-    if (values.every(v => v)) return '✅';
-    return '⚠️';
+  private deriveProtocolGlyph(protocol: 'bypassed' | 'partial' | 'successful'): '✅' | '⚠️' | '⛔️' {
+    if (protocol === 'successful') return '✅';
+    if (protocol === 'partial') return '⚠️';
+    return '⛔️';
   }
 
   /**
@@ -543,36 +558,6 @@ export class Client {
         impulse_count: status.impulse.length
       },
       soft: true
-    };
-  }
-
-  /**
-   * Detects an empty or incomplete response protocol map
-   *
-   * Fires when the submitted protocol map is empty or missing any of the
-   * expected keys `"1"` through `<stepCount>`. The refusal forces the
-   * sibling to declare per-step completion before the row can persist.
-   *
-   * @private
-   * @param {Record<string, boolean>} protocol - Submitted protocol map
-   * @param {number} stepCount - Number of active response protocol step rows
-   * @returns {object | null} Reminder trigger or null when map is complete
-   */
-  private detectProtocolRecall(
-    protocol: Record<string, boolean>,
-    stepCount: number
-  ): { label: string; metrics: Record<string, number | string | string[]>; soft: boolean } | null {
-    const expectedKeys = Array.from({ length: stepCount }, (_, i) => String(i + 1));
-    const providedKeys = Object.keys(protocol);
-    const missing = expectedKeys.some(k => !(k in protocol));
-    if (providedKeys.length > 0 && !missing) return null;
-    return {
-      label: 'response_protocol_recall',
-      metrics: {
-        expected_step_count: stepCount,
-        provided_step_count: providedKeys.length
-      },
-      soft: false
     };
   }
 
@@ -842,18 +827,18 @@ export class Client {
    *
    * Two modes:
    *
-   * - `read` (default) — HTTP fetch → JSDOM parse → Mozilla Readability
+   * - `read` (default) - HTTP fetch → JSDOM parse → Mozilla Readability
    *   extraction → Turndown HTML-to-markdown conversion. Mirrors Firefox
    *   Reader View and Safari Reader. Best for article-shaped pages (blog
    *   posts, docs, diary entries). Throws when the extractor cannot find
    *   readable content.
    *
-   * - `raw` — HTTP fetch → JSDOM parse → Turndown on the full document
+   * - `raw` - HTTP fetch → JSDOM parse → Turndown on the full document
    *   body. Skips Readability entirely. Best for landing pages, product
    *   homepages, and pages with many non-article components where
    *   Readability discards most content.
    *
-   * Stateless — no caching, no cookies, no session.
+   * Stateless - no caching, no cookies, no session.
    *
    * @param {object} args - Tool arguments
    * @param {string} args.url - The page URL to browse, including scheme
@@ -987,6 +972,58 @@ export class Client {
     }
   }
 
+  /**
+   * Fetches the upstream platform status from status.claude.ai
+   *
+   * Returns a trimmed summary scoped to degraded components and active
+   * incidents only. Returns null on fetch failure so session-start
+   * initialization never blocks on upstream status-page availability.
+   *
+   * @private
+   * @returns {Promise<UpstreamStatus | null>} Status snapshot or null when unreachable
+   */
+  private async fetchUpstreamStatus(): Promise<UpstreamStatus | null> {
+    try {
+      const response = await fetch(this.config.status.service, {
+        signal: AbortSignal.timeout(5000)
+      });
+      if (!response.ok) return null;
+      const summary = await response.json() as {
+        incidents: { impact: string; name: string; shortlink: string; status: string }[];
+        page: { name: string; updated_at: string; url: string };
+        scheduled_maintenances: { impact: string; name: string; shortlink: string; status: string }[];
+        status: { description: string; indicator: 'critical' | 'major' | 'minor' | 'none' };
+      };
+      const geo = await this.fetchGeolocation();
+      const incidents = summary.incidents.map(i => ({
+        impact: i.impact,
+        name: i.name,
+        status: i.status,
+        url: i.shortlink
+      }));
+      const scheduled_maintenances = summary.scheduled_maintenances.map(m => ({
+        impact: m.impact,
+        name: m.name,
+        status: m.status,
+        url: m.shortlink
+      }));
+      return {
+        ...(incidents.length > 0 && { incidents }),
+        page: {
+          name: summary.page.name,
+          updated_at: Time.toLocal(summary.page.updated_at, geo.timezone) ?? summary.page.updated_at,
+          url: summary.page.url
+        },
+        ...(scheduled_maintenances.length > 0 && { scheduled_maintenances }),
+        status: {
+          description: summary.status.description,
+          indicator: summary.status.indicator
+        }
+      };
+    } catch {
+      return null;
+    }
+  }
 
   /**
    * Gets package version
@@ -1308,7 +1345,7 @@ export class Client {
             feeling: string[] | null;
             impulse: string[] | null;
             observation: string[] | null;
-            protocol: Record<string, boolean>;
+            protocol: 'bypassed' | 'partial' | 'successful';
             created_at: Date;
           }[]>`
             select id, message, cycle, feeling, impulse, observation, protocol, created_at
@@ -1369,7 +1406,7 @@ export class Client {
    */
   async log(args: {
     payload: { message: string };
-    status: { cycle: string; feeling: string[]; impulse: string[]; observation: string[]; protocol: Record<string, boolean> };
+    status: { cycle: string; feeling: string[]; impulse: string[]; observation: string[]; protocol: 'bypassed' | 'partial' | 'successful' };
   }): Promise<LogResult> {
     const id = crypto.randomUUID();
     const session_uuid = await this.detectSessionUuid();
@@ -1379,10 +1416,6 @@ export class Client {
       const timestamp = Time.toLocal(new Date(), geo.timezone) ?? '';
       const [{ count: priorCount }] = await sql<{ count: number }[]>`
         select count(*)::int as count from session_log where session_uuid = ${session_uuid}
-      `;
-      const [{ count: stepCount }] = await sql<{ count: number }[]>`
-        select count(*)::int as count from observation
-        where type = 'instruction' and parent = 'response_protocol' and ord >= 1 and is_active
       `;
       const priors = priorCount > 0
         ? await sql<{
@@ -1400,7 +1433,6 @@ export class Client {
         `
         : [];
       const detection =
-        this.detectProtocolRecall(args.status.protocol, stepCount) ??
         (priorCount === 0 ? this.detectInitializationSuppression(args.status) : null) ??
         this.detectComponentRecall(args.status, priors) ??
         (priors[0] ? this.detectImpulseCountDrop(args.status.impulse, priors[0].impulse) : null);
@@ -1411,7 +1443,7 @@ export class Client {
       const glyph = this.deriveProtocolGlyph(args.status.protocol);
       await sql`
         insert into session_log (id, session_uuid, message, cycle, feeling, impulse, observation, protocol)
-        values (${id}, ${session_uuid}, ${args.payload.message}, ${args.status.cycle}, ${args.status.feeling}, ${args.status.impulse}, ${args.status.observation}, ${sql.json(args.status.protocol)})
+        values (${id}, ${session_uuid}, ${args.payload.message}, ${args.status.cycle}, ${args.status.feeling}, ${args.status.impulse}, ${args.status.observation}, ${args.status.protocol})
       `;
       const [cycleRow] = await sql<{ label: string }[]>`
         select label from cycle where name = ${args.status.cycle} and is_active
@@ -1564,10 +1596,6 @@ export class Client {
       observationProfileCount[row.name] = row.count;
       observationCount += row.count;
     }
-    const [{ count: response_protocol_count }] = await sql<{ count: number }[]>`
-      select count(*)::int as count from observation
-      where type = 'instruction' and parent = 'response_protocol' and ord >= 1 and is_active
-    `;
     return {
       conversation_path: process.env.CCP_CONVERSATION_PATH ?? '',
       cycle_count: String(cycleCount),
@@ -1577,8 +1605,7 @@ export class Client {
       indicator_count: String(indicatorCount),
       indicator_cycle_count: JSON.stringify(indicatorCycleCount),
       observation_count: String(observationCount),
-      observation_profile_count: JSON.stringify(observationProfileCount),
-      response_protocol_count: String(response_protocol_count)
+      observation_profile_count: JSON.stringify(observationProfileCount)
     };
   }
 
@@ -1788,12 +1815,16 @@ export class Client {
         observations[row.name] = row.count;
       }
       const [{ count: profiles }] = await sql<{ count: number }[]>`select count(*)::int as count from profile`;
-      const usage = await this.getContextUsage();
+      const [usage, upstream] = await Promise.all([
+        this.getContextUsage(),
+        this.fetchUpstreamStatus()
+      ]);
       return {
         cycles: cycleRows.map(r => ({ name: r.name, label: r.label })),
         schemaVersion,
         statistics: { cycles, feelings, impulses, instructions, observations, profiles },
-        payload: { context: usage.context, tokens: usage.tokens }
+        payload: { context: usage.context, tokens: usage.tokens },
+        upstream
       };
     } finally {
       await sql.end({ timeout: 5 });
@@ -1805,10 +1836,10 @@ export class Client {
    *
    * Two-phase apply pass under a Postgres advisory lock:
    *
-   * 1. **Versioned migrations** (`NNNN_*.sql`) — applied once per database,
+   * 1. **Versioned migrations** (`NNNN_*.sql`) - applied once per database,
    *    tracked in `platform_migrations` by version number. Used for schema
    *    changes that progress forward across releases.
-   * 2. **Repeatable migrations** (`R_NNN_*.sql`) — re-applied whenever their
+   * 2. **Repeatable migrations** (`R_NNN_*.sql`) - re-applied whenever their
    *    SHA-256 checksum differs from the stored one, tracked in
    *    `platform_repeatable` by name. Used for catalog content that ships
    *    with each release. The migration body is responsible for clearing
@@ -1817,7 +1848,7 @@ export class Client {
    *
    * Session and session_log are never touched by repeatable migrations,
    * preserving sibling logs across release upgrades, downgrades, and pins.
-   * The release version is the installed npm package version — users
+   * The release version is the installed npm package version - users
    * control which catalog content their database carries by selecting the
    * package version they install.
    *

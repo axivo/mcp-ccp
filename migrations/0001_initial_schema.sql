@@ -40,6 +40,8 @@ create type observation_type as enum ('feeling', 'impulse', 'instruction', 'payl
 
 create type project_status as enum ('active', 'archived');
 
+create type response_protocol as enum ('bypassed', 'partial', 'successful');
+
 create type task_priority as enum ('high', 'low', 'medium', 'urgent');
 
 create type task_status as enum ('abandoned', 'blocked', 'completed', 'in_progress', 'planned');
@@ -154,7 +156,7 @@ create table session_log (
   feeling       text[],
   impulse       text[],
   observation   text[],
-  protocol      jsonb not null default '{}'::jsonb,
+  protocol      response_protocol not null default 'bypassed',
   created_at    timestamptz not null default now()
 );
 
