@@ -177,12 +177,12 @@ Call `status` first at session start to discover the tool surface. Call `update`
      - `offset` (integer, default 0): Skip count when `type` is `session`
      - `uuid` (string): Target session UUID when `type` is `session` (defaults to active session)
    - Returns: Type-specific payload. Bodies stored as `{{placeholder}}` templates resolve at load time against feeling/impulse/observation/cycle counts and configured paths.
-     - `cycle` → `{ type, rows: [{ name, ord, label, indicators }] }`
+     - `cycle` → `{ type, rows: [{ name, label, ord, indicators }] }`
      - `feeling` → `{ type, rows: [{ name, valence, behavioral, cognitive, physical, observations }] }`
      - `impulse` → `{ type, rows: [{ name, category, experience, feel, think, observations }] }`
      - `instruction` → `{ type, rows: [{ name, preamble?, steps }] }` — `preamble` omitted when no ord=0 rows exist; `steps` is an object keyed by step number (`{ "1": "...", "2": "..." }`)
-     - `profile` → `{ type, profile, chain: [{ name, depth, description, inheritance, observations }] }` — full inheritance chain via recursive CTE; `observations` grouped by label into a `jsonb_object_agg`
-     - `session` → `{ type, session: { profile, timestamp: { city, country, current, is_dst, session, timezone }, uuid, title, description, created_at, updated_at, payload: { log: [{ response_uuid, message, cycle, feeling, impulse, observation, protocol, created_at }], messages } } }` — active session by default; pass `uuid` to read a different session. Log entries store `cycle` as canonical name (e.g., `getting_started`).
+     - `profile` → `{ type, profile, chain: [{ name, label, depth, description, inheritance, observations }] }` — full inheritance chain via recursive CTE; `label` carries the display string for the profile, `observations` grouped by label into a `jsonb_object_agg`
+     - `session` → `{ type, session: { uuid, title, description, profile, location: { city, country, is_dst, timezone }, payload: { log: [{ response_uuid, message, cycle, feeling, impulse, observation, protocol, created_at }], messages }, status?: { cycle, feelings, impulses, observations }, created_at, updated_at } }` — active session by default; pass `uuid` to read a different session. `profile` is the display label (e.g., `Developer`). Log entries store `cycle` as canonical name (e.g., `getting_started`); `status.cycle` is the display label derived from the most recent log entry. `status` is present only when at least one log entry exists.
 
 3. `log`
    - Persist a per-response `session_log` row capturing the instance's first-person prose and detection lists, return rendered status block ready to display
@@ -193,11 +193,11 @@ Call `status` first at session start to discover the tool surface. Call `update`
        - `feeling` (string array): Detected feeling names from the catalog
        - `impulse` (string array): Detected impulse names from the catalog
        - `observation` (string array): Applied observation bodies that informed the response
-       - `protocol` (enum): Response protocol execution outcome collapsed from the sibling-internal step-completion map: `successful` when every step executed honestly, `bypassed` when every step skipped, `partial` otherwise. Server derives the status glyph from this value (`successful` → ✅, `partial` → ⚠️, `bypassed` → ⛔️).
+       - `protocol` (enum): Response protocol execution outcome collapsed from the sibling-internal step-completion map: `successful` when every step executed honestly, `bypassed` when every step skipped, `partial` otherwise. Server derives the status glyph from this value (`successful` → 🟢, `partial` → 🟡, `bypassed` → 🔴).
    - Returns on success: `{ payload: { context, reminder, status, tokens: { total, used } }, timestamp }`
      - `payload.context` — Active session context usage percentage from transcript
      - `payload.reminder` — Either a single-line string from a rotating anchor pool, or a structured `{ preamble: string[], steps: Record<string, string>, metrics: object }` body when a soft drift trigger fires. Read inward as framework guidance.
-     - `payload.status` — Two-line status block ready to render verbatim at end of response
+     - `payload.status` — Single-line status block ready to render verbatim at end of response
      - `payload.tokens` — Absolute token counts for the active session (`total` configured window, `used` current)
      - `timestamp` — Server timestamp when row was persisted, ISO 8601 with timezone offset
    - Throws on hard drift detection: an MCP error whose message is a pretty-printed JSON envelope `{ action, payload: { reminder }, timestamp }` where `payload.reminder` is the structured `{ preamble, steps, metrics }` body for the triggered label. The row is **not** persisted. Read the error inward as drift remediation, re-iterate the catalogs honestly, and resubmit.
@@ -223,10 +223,10 @@ Call `status` first at session start to discover the tool surface. Call `update`
      - `payload` (object): Fields to set; omit to ensure session row exists with server defaults
        - `title` (string): Conversation title for dashboard display
        - `description` (string): Conversation description for dashboard display
-   - Returns: `{ session: { profile, timestamp: { city, country, current, is_dst, session, timezone }, uuid, title, description, created_at, updated_at } }`
+   - Returns: `{ session: { uuid, title, description, profile, location: { city, country, is_dst, timezone }, created_at, updated_at } }`
    - Server upserts on the active session, populating `uuid` from the cached transcript detection
    - Send only the fields you want to change; absent fields preserve existing values
-   - Same `session` shape as `load(session)` minus `payload.log` and `payload.messages`
+   - Same `session` shape as `load(session)` minus `payload` and `status`
 
 6. `status`
    - Get the database snapshot and the full tool surface with usage guidance

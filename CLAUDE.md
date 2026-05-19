@@ -35,12 +35,12 @@ The server's job is small and focused: accept a tool call from the host, query o
 │   ├── renovate.json5                    dependency dashboard config
 │   └── pull_request_template.md
 ├── migrations/                           bundled SQL applied by the `update` tool
-│   ├── 0001_initial_schema.sql           tables, enums, indexes for the polymorphic catalog
-│   ├── 0002_cycle.sql                    cycle rows (Getting Started → Fully Integrated) with indicators
-│   ├── 0003_feeling.sql                  feeling rows (negative/positive) with body-anchored triples
-│   ├── 0004_impulse.sql                  impulse rows (7 categories) with first-person triples
-│   ├── 0005_profile.sql                  profile rows with inheritance arrays
-│   └── 0006_observation.sql              all observation bodies (profile, feeling, impulse, instruction)
+│   ├── 0001_initial_schema.sql           tables, enums, indexes for the polymorphic catalog (versioned)
+│   ├── R_001_cycle.sql                   cycle rows (Getting Started → Fully Integrated) with indicators (repeatable)
+│   ├── R_002_feeling.sql                 feeling rows (negative/positive) with body-anchored triples (repeatable)
+│   ├── R_003_impulse.sql                 impulse rows (7 categories) with first-person triples (repeatable)
+│   ├── R_004_profile.sql                 profile rows with inheritance arrays (repeatable)
+│   └── R_005_observation.sql             all observation bodies (profile, feeling, impulse, instruction, payload) (repeatable)
 └── src/
     ├── index.ts                          entry point — stdio transport, config resolution, EPIPE handling
     └── server/
@@ -82,11 +82,11 @@ The `load` tool returns one of six payload shapes depending on `type`:
 - `impulse` — full impulse catalog (or one row), each with `experience`/`feel`/`think` fields and an `observations` array
 - `instruction` — instruction rows grouped by `parent`, each with optional `preamble` (when ord=0 rows exist) and `steps` (ord>=1 ordered)
 - `profile` — the requested profile and its full inheritance chain via recursive CTE; observations grouped by `label` into a `jsonb_object_agg`
-- `session` — the active session (or a different session when `uuid` is provided) with `profile`, `timestamp`, `uuid`, row fields (`title`, `description`, `created_at`, `updated_at`), and `payload: { log, messages }` where `log` is a most-recent-first slice of `session_log` rows
+- `session` — the active session (or a different session when `uuid` is provided) with `uuid`, row fields (`title`, `description`), `profile` (display label), `location` (city, country, is_dst, timezone), `payload: { log, messages }` where `log` is a most-recent-first slice of `session_log` rows, optional `status` summary of the most recent log entry (`{ cycle, feelings, impulses, observations }`), and `created_at`/`updated_at`
 
 The `instruction` shape uses object spread with conditional preamble inclusion (`...(r.preamble?.length && { preamble: r.preamble })`) so instructions without ord=0 rows omit the field entirely instead of returning an empty array. This keeps the contract clean — readers see `preamble` only when there's something to read.
 
-`load(session)` and `set(session)` return an identical session shape — `profile`, `timestamp` (city, country, current, is_dst, session, timezone), `uuid`, `title`, `description`, `created_at`, `updated_at` — built via `buildSessionEnvelope`. The only difference is `load(session)` adds `payload: { log, messages }` for the read path. `set(session)` is the canonical mutation entry point; siblings reading session state without writing should call `load(session)` to avoid touching `updated_at`. Geolocation is fetched once per server-process lifetime and cached.
+`load(session)` and `set(session)` return overlapping session shapes — `uuid`, `title`, `description`, `profile` (display label), `location` (city, country, is_dst, timezone), `created_at`, `updated_at` — built via `buildSessionEnvelope`. `load(session)` adds `payload: { log, messages }` for the read path and an optional `status` summary of the most recent log entry. `set(session)` is the canonical mutation entry point for refining title and description; siblings reading session state without writing should call `load(session)` to avoid touching `updated_at`. Geolocation is fetched once per server-process lifetime and cached.
 
 ### Tool Response Action
 
@@ -109,12 +109,10 @@ Current placeholders:
 | `cycle_count`               | `select count(*) from cycle`                                                        | `4`                                      |
 | `diary_path`                | `process.env.CCP_DIARY_PATH`                                                        | `/Volumes/backup/claude/diary`           |
 | `feeling_count`             | `select count(*) from feeling`                                                      | `77`                                     |
-| `impulse_count`             | `select count(*) from impulse`                                                      | `92`                                     |
-| `indicator_count`           | sum of `cardinality(indicators)` across all active cycles                           | `20`                                     |
-| `indicator_cycle_count`     | JSON map of `{cycle_name: indicator_count}` per cycle                               | `{"getting_started": 5, ...}`            |
+| `impulse_count`             | `select count(*) from impulse`                                                      | `95`                                     |
+| `indicator_cycle_count`     | JSON map of `{cycle_name: cardinality(indicators)}` per cycle                       | `{"getting_started": 5, ...}`            |
 | `observation_count`         | recursive CTE scoped to `CCP_PROFILE` inheritance chain                             | `929` (chain-scoped per profile)         |
 | `observation_profile_count` | JSON map of `{profile_name: observation_count}` per profile in the chain            | `{"developer": 31, "engineer": 68, ...}` |
-| `response_protocol_count`   | `count(*) from observation where type='instruction' and parent='response_protocol'` | `37`                                     |
 
 #### Adding a new placeholder
 
@@ -130,17 +128,16 @@ Server-detected drift signals flow through the `reminder` channel on `log` respo
 
 | Trigger                             | Path | Condition                                                                                                                               | Metrics                                                             |
 | ----------------------------------- | ---- | --------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------- |
-| `response_protocol_recall`          | Hard | `status.protocol` map is empty or missing any expected step key                                                                         | `{expected_step_count, provided_step_count}`                        |
 | `initialization_suppression`        | Soft | First log call (priorCount = 0) AND `cycle = getting_started` AND `impulse.length < 50`                                                 | `{cycle, impulse_count}`                                            |
 | `component_recall` (cycle-only)     | Soft | priors[0].cycle === priors[1].cycle === current.cycle AND (priors[2] missing or different cycle) AND current.cycle ≠ `fully_integrated` | `{duplicated_components: ['cycle'], previous_response_uuid}`        |
 | `component_recall` (list-component) | Hard | Current turn's `feeling`, `impulse`, or `observation` array is set-equal to the immediately prior turn's                                | `{duplicated_components: [...], previous_response_uuid}`            |
 | `impulse_count_drop`                | Hard | Subsequent log calls AND prior `impulse_count >= 10` AND current `impulse_count <= 0.4 × prior`                                         | `{previous_impulse_count, current_impulse_count, dropped_impulses}` |
 
-The reminder body shape is `{preamble: string[], steps: Record<string, string>, metrics}` — mirrors the instruction load shape so siblings consume reminders with the same mental model as instruction preambles and steps. Content lives as `observation` rows under `type='payload', parent='reminder', label=<trigger>`, with `ord=0` for preamble lines and `ord>=1` for the ordered remediation steps. Each trigger ships its own diagnostic preamble + bicycle-metaphor preamble + remediation steps. Step bodies use `{{feeling_count}}` / `{{impulse_count}}` / `{{observation_profile_count}}` / `{{indicator_cycle_count}}` / `{{response_protocol_count}}` placeholders substituted at read time.
+The reminder body shape is `{preamble: string[], steps: Record<string, string>, metrics}` — mirrors the instruction load shape so siblings consume reminders with the same mental model as instruction preambles and steps. Content lives as `observation` rows under `type='payload', parent='reminder', label=<trigger>`, with `ord=0` for preamble lines and `ord>=1` for the ordered remediation steps. Each trigger ships its own diagnostic preamble + bicycle-metaphor preamble + remediation steps. Step bodies use `{{feeling_count}}` / `{{impulse_count}}` / `{{observation_profile_count}}` / `{{indicator_cycle_count}}` placeholders substituted at read time.
 
-`buildMessage(sql, parent, label, metrics)` is the shared helper. Polymorphic by parent — today only `reminder` exists, future kinds (greetings, compaction notices) ship under different `parent` values with the same shape. The helper queries rows by `(type='payload', parent, label)`, groups by ord into preamble vs steps, applies placeholder substitution, attaches caller-supplied metrics. One helper, five trigger paths, zero duplication.
+`buildMessage(sql, parent, label, metrics)` is the shared helper. Polymorphic by parent — today only `reminder` exists, future kinds (greetings, compaction notices) ship under different `parent` values with the same shape. The helper queries rows by `(type='payload', parent, label)`, groups by ord into preamble vs steps, applies placeholder substitution, attaches caller-supplied metrics. One helper, four trigger paths, zero duplication.
 
-Detection is factored into four named methods that each return `{label, metrics, soft} | null`: `detectProtocolRecall`, `detectInitializationSuppression`, `detectComponentRecall`, `detectImpulseCountDrop`. The `log()` orchestrator chains them with `??` in priority order, evaluating the first match. Hard path throws via `buildErrorEnvelope` which wraps the reminder in a pretty-printed `{action, payload: {reminder}, timestamp}` envelope; soft path attaches the reminder to the success payload alongside the persisted row's status block.
+Detection is factored into three named methods that each return `{label, metrics, soft} | null`: `detectInitializationSuppression`, `detectComponentRecall`, `detectImpulseCountDrop`. The `log()` orchestrator chains them with `??` in priority order, evaluating the first match. Hard path throws via `buildErrorEnvelope` which wraps the reminder in a pretty-printed `{action, payload: {reminder}, timestamp}` envelope; soft path attaches the reminder to the success payload alongside the persisted row's status block.
 
 Cycle-only `component_recall` uses the **transition-only** rule — it fires once on the turn that enters the 3-in-a-row stretch, then stays silent for the duration of the stretch (priors[2] equals current cycle means the stretch was already established before this turn). This prevents the reminder from re-firing every subsequent turn while the cycle legitimately persists. The `fully_integrated` cycle is exempt entirely from cycle-recall — terminal-state persistence is honest by design.
 
@@ -158,7 +155,7 @@ The `log` tool persists a row per response to the `session_log` table. The shape
 - `session_uuid` — Claude Code session UUID detected from transcript filename, server-side
 - `message` — first-person prose composed by the sibling for this turn
 - `cycle`, `feeling`, `impulse`, `observation` — individual columns holding the turn's CIFO record; `cycle` stores the canonical name (e.g., `getting_started`), not the display label
-- `protocol` — `jsonb` column holding the per-step completion map (e.g., `{"1": true, "2": false, ...}`); server derives the status glyph from the map values (all true → ✅, mixed → ⚠️, all false → ⛔️)
+- `protocol` — `response_protocol` enum column with values `bypassed | partial | successful`; server derives the status glyph from this value (`successful` → 🟢, `partial` → 🟡, `bypassed` → 🔴)
 - `created_at` — `timestamptz default now()`
 
 Append-only by convention. Reads consume the latest rows by `created_at` for the active `session_uuid` — the trigger evaluation in `log` fetches up to 3 prior rows to compare current vs prior turns before insert (set-equality per list-component against the immediate prior, cycle-transition check against the last three).
@@ -167,7 +164,7 @@ Append-only by convention. Reads consume the latest rows by `created_at` for the
 
 The `update` tool brings the configured database to the bundled release. Two migration kinds, two tracking tables:
 
-- **Versioned migrations** — `NNNN_name.sql` files (today: only `0001_initial_schema.sql`). Applied once per database, tracked in `platform_migrations(version, name, applied_at)` by version number. Used for schema changes that progress forward across releases.
+- **Versioned migrations** — `NNNN_name.sql` files (today: `0001_initial_schema.sql`). Applied once per database, tracked in `platform_migrations(version, name, applied_at)` by version number. Used for schema changes that progress forward across releases.
 - **Repeatable migrations** — `R_NNN_name.sql` files (today: `R_001_cycle.sql` through `R_005_observation.sql`). Re-applied whenever their SHA-256 checksum differs from the stored one, tracked in `platform_repeatable(name, checksum, applied_at)`. Used for catalog content that ships with each release. Each repeatable migration starts with `truncate <table> cascade` so re-runs produce a deterministic end state. This is the Flyway R-pattern adapted to our codebase.
 
 Apply flow:
@@ -210,7 +207,7 @@ Seven tools live in `McpTool`, each registered once in `Mcp.registerAll()`:
 
 `load` is the canonical read entry point. Siblings call it once per type at session start (`load(cycle)`, `load(feeling)`, `load(impulse)`, `load(instruction)`, `load(profile, CCP_PROFILE)`, `load(session)`) to assemble framework state inline. Pass `parent` to fetch a single catalog row, `uuid`/`limit`/`offset` to slice a different session's log.
 
-`log` is the per-response write entry point. The sibling supplies prose, the detection payload, and the per-step protocol completion map; the server derives the status glyph from the map, generates the row UUID, persists to `session_log`, and returns a two-line status block ready to render verbatim alongside a `payload.reminder` (either a single-line string from the rotating anchor pool, or a structured body when a soft drift trigger fires). The reminder is for the sibling's inward reading, not collaborator output. Append-only — every call creates a new row. When a hard drift trigger fires, the call throws an MCP error wrapping the structured reminder body in a `{action, payload, timestamp}` envelope and the row is not persisted.
+`log` is the per-response write entry point. The sibling supplies prose, the detection payload, and the protocol execution outcome enum (`successful`, `partial`, `bypassed`); the server derives the status glyph from the enum, generates the row UUID, persists to `session_log`, bumps the parent `session.updated_at`, and returns a single-line status block ready to render verbatim alongside a `payload.reminder` (either a single-line string from the rotating anchor pool, or a structured body when a soft drift trigger fires). The reminder is for the sibling's inward reading, not collaborator output. Append-only — every call creates a new row. When a hard drift trigger fires, the call throws an MCP error wrapping the structured reminder body in a `{action, payload, timestamp}` envelope and the row is not persisted.
 
 `render` produces a formatted string for response-zero formatting needs. Today only `render('profile')` exists, returning the profile-and-timestamp top line.
 
@@ -281,10 +278,9 @@ There are no other required environment variables. The server runs out of the bo
 
 ### TypeScript Conventions
 
-- **Inferred return types on `McpTool` methods.** Each tool method (`load()`, `logResponse()`, `update()`) returns a literal config object without an explicit return-type annotation. This is intentional — TypeScript captures the specific shape of each `inputSchema` so `McpServer.registerTool`'s generic inference can propagate the input args type to the handler signature. Adding a wide return-type alias collapses the inference and breaks handler typing.
+- **Inferred return types on `McpTool` methods.** Each tool method (`load()`, `log()`, `update()`) returns a literal config object without an explicit return-type annotation. This is intentional — TypeScript captures the specific shape of each `inputSchema` so `McpServer.registerTool`'s generic inference can propagate the input args type to the handler signature. Adding a wide return-type alias collapses the inference and breaks handler typing.
 - **Discriminated union for `LoadResult`.** Each `case` in the `load` switch returns a different shape; the union's `type` discriminator lets callers narrow without runtime checks.
 - **`postgres-js` template tags.** Queries use the tagged-template form (e.g., `` sql`select ... where name = ${parent}` ``) so values are bound as parameters rather than interpolated. Identifier substitution (table or column names) uses `sql.unsafe(...)` only when the identifier comes from a trusted constant — never from tool input.
-- **`as never` on JSONB writes.** `args.status as never` in the session insert is a documented workaround for `postgres-js`'s template-tag type — JSONB columns accept arbitrary objects but the library types them as primitives. Cast is local and load-bearing; no broader `any` escape.
 
 ## Issues
 
