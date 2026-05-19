@@ -54,8 +54,8 @@ create type valence as enum ('negative', 'positive');
 
 create table cycle (
   name        text primary key,
-  ord         int not null unique,
   label       text not null,
+  ord         int not null unique,
   indicators  text[] not null,
   is_active   boolean not null default true,
   created_at  timestamptz not null default now(),
@@ -124,6 +124,7 @@ create index idx_observation_label on observation (type, parent, label)
 
 create table profile (
   name        text primary key,
+  label       text not null,
   description text,
   inheritance text[] not null default '{}',
   is_active   boolean not null default true,

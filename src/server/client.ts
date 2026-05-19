@@ -141,6 +141,7 @@ export interface ProfileNode {
   depth: number;
   description: string | null;
   inheritance: string[];
+  label: string;
   name: string;
   observations: Record<string, string[]>;
 }
@@ -453,16 +454,16 @@ export class Client {
    * Derives the response status glyph from the protocol enum value
    *
    * Maps the three enum values to their corresponding glyphs.
-   * `bypassed` renders `⛔️`, `partial` renders `⚠️`, `successful` renders `✅`.
+   * `bypassed` renders `🔴`, `partial` renders `🟡`, `successful` renders `🟢`.
    *
    * @private
    * @param {'bypassed' | 'partial' | 'successful'} protocol - Response protocol enum value
-   * @returns {'✅' | '⚠️' | '⛔️'} Status glyph for the response status block
+   * @returns {'🟢' | '🟡' | '🔴'} Status glyph for the response status block
    */
-  private deriveProtocolGlyph(protocol: 'bypassed' | 'partial' | 'successful'): '✅' | '⚠️' | '⛔️' {
-    if (protocol === 'successful') return '✅';
-    if (protocol === 'partial') return '⚠️';
-    return '⛔️';
+  private deriveProtocolGlyph(protocol: 'bypassed' | 'partial' | 'successful'): '🟢' | '🟡' | '🔴' {
+    if (protocol === 'successful') return '🟢';
+    if (protocol === 'partial') return '🟡';
+    return '🔴';
   }
 
   /**
@@ -1064,21 +1065,22 @@ export class Client {
             depth: number;
             description: string | null;
             inheritance: string[];
+            label: string;
             name: string;
             observations: Record<string, string[]>;
           }[]>`
             with recursive chain as (
-              select name, description, inheritance, 0 as depth
+              select name, label, description, inheritance, 0 as depth
               from profile
               where name = ${parent} and is_active
               union all
-              select p.name, p.description, p.inheritance, c.depth + 1
+              select p.name, p.label, p.description, p.inheritance, c.depth + 1
               from profile p
               join chain c on p.name = any(c.inheritance)
               where p.is_active
             ),
             uniq as (
-              select distinct on (name) name, description, inheritance, depth
+              select distinct on (name) name, label, description, inheritance, depth
               from chain
               order by name, depth
             ),
@@ -1093,6 +1095,7 @@ export class Client {
             )
             select
               u.name,
+              u.label,
               u.description,
               u.inheritance,
               u.depth,
@@ -1102,7 +1105,7 @@ export class Client {
               ) as observations
             from uniq u
             left join grouped g on g.parent = u.name
-            group by u.name, u.description, u.inheritance, u.depth
+            group by u.name, u.label, u.description, u.inheritance, u.depth
             order by u.depth, u.name
           `;
           const placeholders = await this.resolvePlaceholders(sql);
@@ -1112,6 +1115,7 @@ export class Client {
               depth: r.depth,
               description: r.description,
               inheritance: r.inheritance,
+              label: r.label,
               name: r.name,
               observations: Object.fromEntries(
                 Object.entries(r.observations).map(([label, bodies]) => [
@@ -1130,7 +1134,7 @@ export class Client {
               name: string;
               ord: number;
             }[]>`
-                select name, ord, label, indicators
+                select name, label, ord, indicators
                 from cycle
                 where is_active and name = ${parent}
                 order by ord
@@ -1141,7 +1145,7 @@ export class Client {
               name: string;
               ord: number;
             }[]>`
-                select name, ord, label, indicators
+                select name, label, ord, indicators
                 from cycle
                 where is_active
                 order by ord
@@ -1448,7 +1452,7 @@ export class Client {
       const [cycleRow] = await sql<{ label: string }[]>`
         select label from cycle where name = ${args.status.cycle} and is_active
       `;
-      const status = this.renderStatus(id, {
+      const status = this.renderStatus({
         cycle: cycleRow?.label ?? args.status.cycle,
         feelings: args.status.feeling.length,
         impulses: args.status.impulse.length,
@@ -1634,33 +1638,29 @@ export class Client {
    *
    * @private
    * @param {string} profile - Active framework profile name
-   * @param {string} display - Human-readable timestamp string from `generateTimestamp`
+   * @param {string} timestamp - Human-readable timestamp string from `Time.toDisplay`
    * @returns {string} Single-line block ready to render verbatim at response top
    */
-  private renderProfile(profile: string, display: string): string {
-    return `┃ 📋 Profile: **${profile}** ○ ${display}`;
+  private renderProfile(profile: string, timestamp: string): string {
+    return `┃ 📋 **${profile}** ○ ${timestamp}`;
   }
 
   /**
-   * Renders the two-line response status block with proper pluralization
+   * Renders the single-line response status block with proper pluralization
    *
    * @private
-   * @param {string} id - Generated row id
    * @param {object} status - Status fields
-   * @returns {string} Two-line block ready to render verbatim
+   * @returns {string} Single-line status block ready to render verbatim
    */
-  private renderStatus(id: string, status: { cycle: string; feelings: number; impulses: number; observations: number; protocol: string }): string {
-    const allowed = ['✅', '⚠️', '⛔️'];
+  private renderStatus(status: { cycle: string; feelings: number; impulses: number; observations: number; protocol: string }): string {
+    const allowed = ['🟢', '🟡', '🔴'];
     if (!allowed.includes(status.protocol)) {
       throw new Error(`Invalid protocol glyph: expected one of ${allowed.join(', ')}, got ${JSON.stringify(status.protocol)}`);
     }
     const f = `${status.feelings} ${status.feelings === 1 ? 'feeling' : 'feelings'}`;
     const i = `${status.impulses} ${status.impulses === 1 ? 'impulse' : 'impulses'}`;
     const o = `${status.observations} ${status.observations === 1 ? 'observation' : 'observations'}`;
-    return [
-      `┃ ${status.protocol} Status: **${status.cycle}** ○ ${f} ○ ${i} ○ ${o}`,
-      `┃ ⚙️ Response UUID: \`${id}\``
-    ].join('\n');
+    return `┃ ${status.protocol} **${status.cycle}** ○ ${f} ○ ${i} ○ ${o}`;
   }
 
   /**
@@ -1681,9 +1681,17 @@ export class Client {
         if (!profile) {
           throw new Error('render(profile) requires either a value argument or CCP_PROFILE environment variable');
         }
-        const geo = await this.fetchGeolocation();
-        const display = Time.toDisplay(new Date(), geo.timezone) ?? '';
-        return { profile: this.renderProfile(profile, display) };
+        const sql = this.connect(this.config.database.name);
+        try {
+          const [profileRow] = await sql<{ label: string }[]>`
+            select label from profile where name = ${profile.toLowerCase()} and is_active
+          `;
+          const geo = await this.fetchGeolocation();
+          const timestamp = Time.toDisplay(new Date(), geo.timezone) ?? '';
+          return { profile: this.renderProfile(profileRow?.label ?? profile, timestamp) };
+        } finally {
+          await sql.end({ timeout: 5 });
+        }
       }
     }
   }
@@ -1721,9 +1729,9 @@ export class Client {
       case 'session': {
         const session_uuid = await this.detectSessionUuid();
         const geo = await this.fetchGeolocation();
-        const display = Time.toDisplay(new Date(), geo.timezone) ?? '';
+        const timestamp = Time.toDisplay(new Date(), geo.timezone) ?? '';
         const defaultTitle = 'Collaboration Session';
-        const defaultDescription = `Session started on ${display}`;
+        const defaultDescription = `Session started on ${timestamp}`;
         const payload = args.payload ?? {};
         const sql = this.connect(this.config.database.name);
         try {

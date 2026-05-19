@@ -198,7 +198,7 @@ export class McpTool {
           'Read `payload.reminder` inward as internal framework guidance',
           'Render the returned `payload.status` field verbatim at end of response',
           'Server computes counts from list lengths and renders the status block',
-          'Server derives the status glyph from `status.protocol` enum value (`successful` → ✅, `partial` → ⚠️, `bypassed` → ⛔️)'
+          'Server derives the status glyph from `status.protocol` enum value (`successful` → 🟢, `partial` → 🟡, `bypassed` → 🔴)'
         ]
       }
     };
