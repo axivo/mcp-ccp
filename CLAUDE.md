@@ -216,7 +216,7 @@ Seven tools live in `McpTool`, each registered once in `Mcp.registerAll()`:
 
 `set` is the canonical mutation entry point. `set('session')` upserts the `session` row on the active session_uuid, returning the post-write state. Pair with `load('session')` for reads — `set` returns the same `session` shape minus `payload.log` so siblings refreshing memory should call `load` to avoid touching `updated_at`.
 
-`status` returns the database snapshot (schema version, catalog statistics with per-profile observation counts scoped to the active inheritance chain) plus the full tool surface with usage directives. Call at session start to learn what's available.
+`status` returns the database snapshot (schema version, catalog statistics with per-profile observation counts scoped to the active inheritance chain) plus the full tool surface with usage directives. Also fetches the Anthropic platform status from `status.claude.com` and returns it as `upstream` — mirrors the Statuspage summary shape with `page` and `status` always present, `incidents` and `scheduled_maintenances` conditional on being populated, each carrying URLs the sibling can follow via `browse`. Fetched in parallel with the local DB queries (`Promise.all`), fail-soft to `null` on timeout or fetch failure so session-start never blocks on upstream availability. `page.updated_at` is converted to the active session timezone via `Time.toLocal`. Call at session start to learn what's available.
 
 `update` is the lifecycle tool. Call once on a fresh empty database to apply all bundled migrations; call again after upgrading `@axivo/mcp-ccp` to pick up newer migrations.
 
@@ -257,6 +257,7 @@ The schema validates two top-level sections:
 
 - **`database`** — `host` (default `127.0.0.1`), `port` (default `5432`), `name` (default `ccp`), `user` (default `postgres`), `password` (default empty)
 - **`geolocation`** — `service` URL (default `https://ipinfo.io/json`), optional `override` JSON string for offline use, `fallbackTimezone` (default `UTC`)
+- **`status`** — `service` URL for the Anthropic status page summary endpoint (default `https://status.claude.com/api/v2/summary.json`)
 
 The active profile is selected via the `CCP_PROFILE` environment variable, lowercased at every read so siblings can pass `DEVELOPER` or `developer` interchangeably. Required for `load(profile)` and `load(session)` (and any call that builds the session envelope).
 

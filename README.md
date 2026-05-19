@@ -17,8 +17,8 @@ A MCP (Model Context Protocol) server for the [Claude Collaboration Platform](ht
 
 - **Polymorphic Catalog**: Single `observation` table holds bodies for profiles, feelings, impulses, instructions, and payload messages
 - **Profile Inheritance**: Recursive CTE walks the inheritance chain and returns the full profile lineage
-- **Per-Response Session Log**: Typed columns capture cycle, feeling/impulse/observation lists, per-step protocol completion map, and first-person message per response
-- **Drift Reminder Mechanism**: Server-side triggers detect response-protocol drift and route through two paths. Soft triggers (initialization suppression on first turn, cycle-only component recall on the 3-in-a-row transition outside `fully_integrated`) persist the row and return a structured `{preamble, steps, metrics}` reminder in the success payload. Hard triggers (protocol-map empty or incomplete, list-component recall on feeling/impulse/observation set-equality with the prior turn, impulse-count collapse) refuse to persist and throw an MCP error carrying the same structured body — forcing the sibling to re-iterate honestly before the row can be recorded.
+- **Per-Response Session Log**: Typed columns capture cycle, feeling/impulse/observation lists, response protocol enum outcome (`bypassed`, `partial`, `successful`), and first-person message per response
+- **Drift Reminder Mechanism**: Server-side triggers detect response-protocol drift and route through two paths. Soft triggers (initialization suppression on first turn, cycle-only component recall on the 3-in-a-row transition outside `fully_integrated`) persist the row and return a structured `{preamble, steps, metrics}` reminder in the success payload. Hard triggers (list-component recall on feeling/impulse/observation set-equality with the prior turn, impulse-count collapse) refuse to persist and throw an MCP error carrying the same structured body — forcing the sibling to re-iterate honestly before the row can be recorded.
 - **Web Browsing**: The `browse` tool fetches a URL and returns its content as markdown via Mozilla Readability (article-shaped pages, default `read` mode) or full document conversion (landing pages, `raw` mode).
 - **Conversation Metadata**: Separate `session` table carries title and description for dashboard display
 - **Bundled Migrations**: Versioned migrations (`NNNN_*.sql`) and repeatable migrations (`R_NNN_*.sql`, Flyway-style checksum-driven re-apply) ship with the package and apply on demand via the `update` tool
@@ -139,6 +139,7 @@ All fields optional with sensible defaults:
 - `geolocation.service` — IP geolocation service URL (default: `https://ipinfo.io/json`)
 - `geolocation.override` — Optional JSON string for offline use (e.g., `{"city":"Montréal","country":"CA","timezone":"America/Toronto"}`)
 - `mcp.sizeChars` — Per-tool result size cap in characters, advertised in the `_meta` block of tool definitions (default: `500000`)
+- `status.service` — Anthropic status page summary endpoint URL (default: `https://status.claude.com/api/v2/summary.json`)
 
 #### Environment Variables
 
@@ -192,7 +193,7 @@ Call `status` first at session start to discover the tool surface. Call `update`
        - `feeling` (string array): Detected feeling names from the catalog
        - `impulse` (string array): Detected impulse names from the catalog
        - `observation` (string array): Applied observation bodies that informed the response
-       - `protocol` (object): Step-by-step completion map keyed by response protocol step ord (e.g. `{"1": true, "2": false, ...}`), declaring whether each step was executed honestly this turn. Server derives the status glyph from the map values (all true → ✅, mixed → ⚠️, all false → ⛔️).
+       - `protocol` (enum): Response protocol execution outcome collapsed from the sibling-internal step-completion map: `successful` when every step executed honestly, `bypassed` when every step skipped, `partial` otherwise. Server derives the status glyph from this value (`successful` → ✅, `partial` → ⚠️, `bypassed` → ⛔️).
    - Returns on success: `{ payload: { context, reminder, status, tokens: { total, used } }, timestamp }`
      - `payload.context` — Active session context usage percentage from transcript
      - `payload.reminder` — Either a single-line string from a rotating anchor pool, or a structured `{ preamble: string[], steps: Record<string, string>, metrics: object }` body when a soft drift trigger fires. Read inward as framework guidance.
@@ -201,8 +202,8 @@ Call `status` first at session start to discover the tool surface. Call `update`
      - `timestamp` — Server timestamp when row was persisted, ISO 8601 with timezone offset
    - Throws on hard drift detection: an MCP error whose message is a pretty-printed JSON envelope `{ action, payload: { reminder }, timestamp }` where `payload.reminder` is the structured `{ preamble, steps, metrics }` body for the triggered label. The row is **not** persisted. Read the error inward as drift remediation, re-iterate the catalogs honestly, and resubmit.
    - Soft triggers persist the row and surface the structured reminder via `payload.reminder`: `initialization_suppression` (first response with `getting_started` cycle and impulse count below 50), cycle-only `component_recall` (cycle is the same across the last 3 turns outside `fully_integrated`, on the transition turn into 3-in-a-row).
-   - Hard triggers refuse and throw: `response_protocol_recall` (status.protocol map is empty or missing any expected key), list-component `component_recall` (current turn's `feeling`, `impulse`, or `observation` array is set-equal to the immediately prior turn's), `impulse_count_drop` (impulse count crashes by 60%+ when the prior count was at least 10).
-   - Server generates the row id, evaluates drift triggers in priority order (protocol-map completeness, initialization suppression, component recall, impulse-count drop), derives the status glyph from the protocol map, routes through the soft or hard path, and on success renders the status block by looking up the cycle's display label from the catalog
+   - Hard triggers refuse and throw: list-component `component_recall` (current turn's `feeling`, `impulse`, or `observation` array is set-equal to the immediately prior turn's), `impulse_count_drop` (impulse count crashes by 60%+ when the prior count was at least 10).
+   - Server generates the row id, evaluates drift triggers in priority order (initialization suppression, component recall, impulse-count drop), derives the status glyph from the protocol enum value, routes through the soft or hard path, and on success renders the status block by looking up the cycle's display label from the catalog
    - Append-only — every call creates a new `session_log` row
 
 4. `render`
@@ -230,12 +231,13 @@ Call `status` first at session start to discover the tool surface. Call `update`
 6. `status`
    - Get the database snapshot and the full tool surface with usage guidance
    - No inputs
-   - Returns: `{ database, payload, tools }`
+   - Returns: `{ database, payload, tools, upstream }`
      - `database` — `{ cycles, schemaVersion, statistics: { cycles, feelings, impulses, instructions, observations, profiles } }`
        - `cycles` is an array of `{ name, label }` pairs ordered by cycle progression (`getting_started` → `fully_integrated`). The `name` field is the canonical identifier siblings pass to `log` as `status.cycle`; the `label` is the display string rendered in the response status line.
        - `statistics.observations` is a per-profile map keyed by profile name across the active `CCP_PROFILE` inheritance chain, ordered by depth (active profile first). Sum the values for the chain total.
      - `payload` — `{ context, tokens: { total, used } }` — active session context usage and absolute token counts
      - `tools` — Array of tool definitions with name, description, schemas, annotations, and usage directives
+     - `upstream` — Anthropic platform health snapshot mirroring the [Statuspage summary endpoint](https://status.claude.com/api/v2/summary.json) shape: `{ page: { name, updated_at, url }, status: { description, indicator } }` with `incidents` and `scheduled_maintenances` appended only when populated, each carrying public status-page URLs siblings can follow via the `browse` tool. `page.updated_at` is converted to the active session timezone. `null` when the status page is unreachable.
    - Read-only; called once at session start for orientation
 
 7. `update`
