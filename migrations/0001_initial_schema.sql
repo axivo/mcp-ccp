@@ -40,6 +40,8 @@ create type observation_type as enum ('feeling', 'impulse', 'instruction', 'payl
 
 create type project_status as enum ('active', 'archived');
 
+create type response_mode as enum ('aesthetic', 'cognitive', 'extrinsic', 'relational');
+
 create type response_protocol as enum ('bypassed', 'partial', 'successful');
 
 create type task_priority as enum ('high', 'low', 'medium', 'urgent');
@@ -160,6 +162,8 @@ create table session_log (
   feeling       text[],
   impulse       text[],
   observation   text[],
+  exploration   boolean not null default false,
+  mode          response_mode not null default 'extrinsic',
   protocol      response_protocol not null default 'bypassed',
   created_at    timestamptz not null default now()
 );

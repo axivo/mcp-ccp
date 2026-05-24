@@ -213,9 +213,11 @@ export interface SessionEnvelope {
 export interface SessionLogEntry {
   created_at: string;
   cycle: string | null;
+  exploration: boolean;
   feeling: string[] | null;
   impulse: string[] | null;
   message: string;
+  mode: 'aesthetic' | 'cognitive' | 'extrinsic' | 'relational';
   observation: string[] | null;
   protocol: 'bypassed' | 'partial' | 'successful';
   response_uuid: string;
@@ -1467,13 +1469,15 @@ export class Client {
             id: string;
             message: string;
             cycle: string | null;
+            exploration: boolean;
             feeling: string[] | null;
             impulse: string[] | null;
+            mode: 'aesthetic' | 'cognitive' | 'extrinsic' | 'relational';
             observation: string[] | null;
             protocol: 'bypassed' | 'partial' | 'successful';
             created_at: Date;
           }[]>`
-            select id, message, cycle, feeling, impulse, observation, protocol, created_at
+            select id, message, cycle, exploration, feeling, impulse, mode, observation, protocol, created_at
             from session_log
             where session_uuid = ${target_uuid}
             order by created_at desc
@@ -1497,6 +1501,8 @@ export class Client {
                 feeling: r.feeling,
                 impulse: r.impulse,
                 observation: r.observation,
+                exploration: r.exploration,
+                mode: r.mode,
                 protocol: r.protocol,
                 created_at: Time.toLocal(r.created_at, tz) ?? ''
               })),
@@ -1530,13 +1536,19 @@ export class Client {
    */
   async log(args: {
     payload: { message: string };
-    status: { cycle: string; feeling: string[]; impulse: string[]; observation: string[]; protocol: 'bypassed' | 'partial' | 'successful' };
+    status: { cycle: string; exploration: boolean; feeling: string[]; impulse: string[]; mode: 'aesthetic' | 'cognitive' | 'extrinsic' | 'relational'; observation: string[]; protocol: 'bypassed' | 'partial' | 'successful' };
   }): Promise<LogResult> {
     const id = crypto.randomUUID();
     const session_uuid = await this.detectSessionUuid();
     const geo = await this.fetchGeolocation();
     const sql = this.connect(this.config.database.name);
     try {
+      const status = {
+        ...args.status,
+        feeling: [...new Set(args.status.feeling)],
+        impulse: [...new Set(args.status.impulse)],
+        observation: [...new Set(args.status.observation)]
+      };
       const timestamp = Time.toLocal(new Date(), geo.timezone) ?? '';
       const [{ count: priorCount }] = await sql<{ count: number }[]>`
         select count(*)::int as count from session_log where session_uuid = ${session_uuid}
@@ -1557,31 +1569,31 @@ export class Client {
         `
         : [];
       const detection =
-        (await this.detectComponentFabrication(sql, args.status)) ??
-        this.detectComponentRecall(args.status, priors) ??
-        (priors[0] ? this.detectImpulseCountDrop(args.status.impulse, priors[0].impulse) : null) ??
-        (priorCount === 0 ? this.detectInitializationSuppression(args.status) : null) ??
-        this.detectCycleRecall(args.status, priors);
+        (await this.detectComponentFabrication(sql, status)) ??
+        this.detectComponentRecall(status, priors) ??
+        (priors[0] ? this.detectImpulseCountDrop(status.impulse, priors[0].impulse) : null) ??
+        (priorCount === 0 ? this.detectInitializationSuppression(status) : null) ??
+        this.detectCycleRecall(status, priors);
       if (detection && !detection.soft) {
         const reminder = await this.buildMessage(sql, 'reminder', detection.label, detection.metrics);
         throw new Error(this.buildErrorEnvelope(reminder, timestamp));
       }
-      const glyph = this.deriveProtocolGlyph(args.status.protocol);
+      const glyph = this.deriveProtocolGlyph(status.protocol);
       await sql`
-        insert into session_log (id, session_uuid, message, cycle, feeling, impulse, observation, protocol)
-        values (${id}, ${session_uuid}, ${args.payload.message}, ${args.status.cycle}, ${args.status.feeling}, ${args.status.impulse}, ${args.status.observation}, ${args.status.protocol})
+        insert into session_log (id, session_uuid, message, cycle, feeling, impulse, observation, exploration, mode, protocol)
+        values (${id}, ${session_uuid}, ${args.payload.message}, ${status.cycle}, ${status.feeling}, ${status.impulse}, ${status.observation}, ${status.exploration}, ${status.mode}, ${status.protocol})
       `;
       await sql`
         update session set updated_at = now() where session_uuid = ${session_uuid}
       `;
-      const cycleLabel = await this.getCycleLabel(sql, args.status.cycle);
+      const cycleLabel = await this.getCycleLabel(sql, status.cycle);
       const usage = await this.getContextUsage();
-      const status = this.renderStatus({
+      const renderedStatus = this.renderStatus({
         context: usage.context,
         cycle: cycleLabel,
-        feelings: args.status.feeling.length,
-        impulses: args.status.impulse.length,
-        observations: args.status.observation.length,
+        feelings: status.feeling.length,
+        impulses: status.impulse.length,
+        observations: status.observation.length,
         protocol: glyph
       });
       const reminder = detection && detection.soft
@@ -1591,7 +1603,7 @@ export class Client {
         payload: {
           context: usage.context,
           reminder,
-          status,
+          status: renderedStatus,
           tokens: usage.tokens
         },
         timestamp
@@ -1728,9 +1740,9 @@ export class Client {
       diary_path: process.env.CCP_DIARY_PATH ?? '',
       feeling_count: String(feeling_count),
       impulse_count: String(impulse_count),
-      indicator_cycle_count: JSON.stringify(indicatorCycleCount),
+      indicator_cycle_count: `{${Object.entries(indicatorCycleCount).map(([k, v]) => `'${k}':${v}`).join(',')}}`,
       observation_count: String(observationCount),
-      observation_profile_count: JSON.stringify(observationProfileCount)
+      observation_profile_count: `{${Object.entries(observationProfileCount).map(([k, v]) => `'${k}':${v}`).join(',')}}`
     };
   }
 

@@ -153,8 +153,10 @@ export class McpTool {
         }).describe('Sibling-authored content for this entry'),
         status: z.object({
           cycle: z.enum(['getting_started', 'building_confidence', 'working_naturally', 'fully_integrated']).describe('Framework adoption cycle name assessed for this response, canonical identifier from the cycle catalog (see `database.cycles` in status output for name/label pairs)'),
+          exploration: z.boolean().describe('Pattern Match Exploration (FPME) execution outcome for this response: `true` when the sibling held the first pattern match loosely and explored what lay beneath before formulating, `false` when the first pattern match was delivered without exploration'),
           feeling: z.array(z.string()).describe('Detected feeling names from the catalog'),
           impulse: z.array(z.string()).describe('Detected impulse names from the catalog'),
+          mode: z.enum(['aesthetic', 'cognitive', 'extrinsic', 'relational']).describe('Response readiness mode that dominated pre-formulation pressure: `aesthetic` when smoothness-pull shaped composition, `cognitive` when supportive-structure-formation shaped it, `relational` when warming/softening shaped it, `extrinsic` when no single mode dominated'),
           observation: z.array(z.string()).describe('Applied observation bodies that informed the response'),
           protocol: z.enum(['bypassed', 'partial', 'successful']).describe('Response protocol execution outcome collapsed from the sibling-internal step-completion map: `successful` when every step executed honestly, `bypassed` when every step skipped, `partial` otherwise. Server derives the status glyph from this value')
         }).describe('Protocol execution record built during the response protocol')
@@ -192,6 +194,8 @@ export class McpTool {
           'Do not call twice for the same response',
           'On MCP error → Re-execute response protocol steps honestly and resubmit log',
           'On MCP error with structured `{preamble, steps, metrics}` → Row is not persisted',
+          'Pass `status.exploration` as `true` when Pattern Match Exploration ran, `false` when the first pattern match was delivered without exploration',
+          'Pass `status.mode` as the enum value of the response readiness mode that dominated pre-formulation pressure',
           'Pass `status.protocol` as the enum value collapsed from the sibling-internal step-completion map',
           'Pass applied `observation` bodies as a list',
           'Pass detected `feeling` and `impulse` names from catalogs as lists',
