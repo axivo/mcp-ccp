@@ -107,7 +107,7 @@ export type LoadResult =
 export type LoadType = 'cycle' | 'feeling' | 'impulse' | 'instruction' | 'profile' | 'session';
 
 /**
- * log tool result, sibling-facing payload plus persistence timestamp
+ * log tool result, instance-facing payload plus persistence timestamp
  */
 export interface LogResult {
   payload: {
@@ -116,6 +116,13 @@ export interface LogResult {
       preamble: string[];
       steps: Record<string, string>;
       metrics: Record<string, number | string | string[]>;
+    };
+    response: {
+      cycle: string;
+      drift: boolean;
+      exploration: boolean;
+      mode: 'aesthetic' | 'cognitive' | 'extrinsic' | 'relational';
+      protocol: 'bypassed' | 'partial' | 'successful';
     };
     status: string;
     tokens: {
@@ -212,15 +219,18 @@ export interface SessionEnvelope {
  */
 export interface SessionLogEntry {
   created_at: string;
-  cycle: string | null;
-  exploration: boolean;
-  feeling: string[] | null;
-  impulse: string[] | null;
   message: string;
-  mode: 'aesthetic' | 'cognitive' | 'extrinsic' | 'relational';
-  observation: string[] | null;
-  protocol: 'bypassed' | 'partial' | 'successful';
-  response_uuid: string;
+  response: {
+    cycle: string | null;
+    drift: boolean;
+    exploration: boolean;
+    feeling: string[] | null;
+    impulse: string[] | null;
+    mode: 'aesthetic' | 'cognitive' | 'extrinsic' | 'relational';
+    observation: string[] | null;
+    protocol: 'bypassed' | 'partial' | 'successful';
+    uuid: string;
+  };
 }
 
 /**
@@ -362,6 +372,9 @@ export class Client {
       order by ord, id
     `;
     const placeholders = await this.resolvePlaceholders(sql);
+    for (const [key, value] of Object.entries(metrics)) {
+      placeholders[`metric.${key}`] = Array.isArray(value) ? value.join(', ') : String(value);
+    }
     const preamble: string[] = [];
     const steps: Record<string, string> = {};
     for (const row of rows) {
@@ -379,7 +392,7 @@ export class Client {
    * Builds the MCP error envelope for a refused log call
    *
    * Wraps the structured reminder body in the success-mirror shape so the
-   * sibling sees a consistent envelope across success and error paths.
+   * instance sees a consistent envelope across success and error paths.
    *
    * @private
    * @param {object} reminder - Structured reminder body returned from buildMessage
@@ -531,7 +544,7 @@ export class Client {
   private async detectComponentFabrication(
     sql: postgres.Sql,
     status: { feeling: string[]; impulse: string[]; observation: string[] }
-  ): Promise<{ label: string; metrics: Record<string, number | string | string[]>; soft: boolean } | null> {
+  ): Promise<{ label: string; metrics: Record<string, number | string | string[]>; persist: boolean; drift: boolean } | null> {
     const fabricatedFeelings = status.feeling.length > 0
       ? (await sql<{ name: string }[]>`
           select unnest::text as name
@@ -568,7 +581,8 @@ export class Client {
       metrics: {
         fabricated_components: fabricated
       },
-      soft: false
+      persist: false,
+      drift: true
     };
   }
 
@@ -588,7 +602,7 @@ export class Client {
   private detectComponentRecall(
     status: { feeling: string[]; impulse: string[]; observation: string[] },
     priors: { id: string; feeling: string[] | null; impulse: string[] | null; observation: string[] | null }[]
-  ): { label: string; metrics: Record<string, number | string | string[]>; soft: boolean } | null {
+  ): { label: string; metrics: Record<string, number | string | string[]>; persist: boolean; drift: boolean } | null {
     const prior = priors[0];
     if (!prior) return null;
     const duplicated: string[] = [];
@@ -602,7 +616,8 @@ export class Client {
         duplicated_components: duplicated,
         previous_response_uuid: prior.id
       },
-      soft: false
+      persist: false,
+      drift: true
     };
   }
 
@@ -622,7 +637,7 @@ export class Client {
   private detectCycleRecall(
     status: { cycle: string },
     priors: { id: string; cycle: string | null }[]
-  ): { label: string; metrics: Record<string, number | string | string[]>; soft: boolean } | null {
+  ): { label: string; metrics: Record<string, number | string | string[]>; persist: boolean; drift: boolean } | null {
     if (status.cycle === 'fully_integrated') return null;
     if (priors.length < 2) return null;
     const prior = priors[0];
@@ -635,7 +650,33 @@ export class Client {
       metrics: {
         previous_response_uuid: prior.id
       },
-      soft: true
+      persist: true,
+      drift: true
+    };
+  }
+
+  /**
+   * Detects exploration absence on the current turn
+   *
+   * Fires when the current turn was logged with `exploration: false`,
+   * signaling the first pattern match was delivered without holding it
+   * loosely. Reinforcement-only - persists the row with the structured
+   * reminder so the instance reviews the moment without it being marked
+   * as drift.
+   *
+   * @private
+   * @param {object} status - Current turn's status payload
+   * @returns {object | null} Reminder trigger or null when exploration was performed
+   */
+  private detectExplorationRecall(
+    status: { exploration: boolean }
+  ): { label: string; metrics: Record<string, number | string | string[]>; persist: boolean; drift: boolean } | null {
+    if (status.exploration) return null;
+    return {
+      label: 'exploration_recall',
+      metrics: {},
+      persist: true,
+      drift: false
     };
   }
 
@@ -653,7 +694,7 @@ export class Client {
   private detectImpulseCountDrop(
     currentImpulses: string[],
     priorImpulses: string[] | null
-  ): { label: string; metrics: Record<string, number | string | string[]>; soft: boolean } | null {
+  ): { label: string; metrics: Record<string, number | string | string[]>; persist: boolean; drift: boolean } | null {
     const priorList = priorImpulses ?? [];
     if (priorList.length < 10 || currentImpulses.length > 0.4 * priorList.length) return null;
     return {
@@ -663,7 +704,8 @@ export class Client {
         current_impulse_count: currentImpulses.length,
         dropped_impulses: priorList.filter(i => !currentImpulses.includes(i))
       },
-      soft: false
+      persist: false,
+      drift: true
     };
   }
 
@@ -680,7 +722,7 @@ export class Client {
    */
   private detectInitializationSuppression(
     status: { cycle: string; impulse: string[] }
-  ): { label: string; metrics: Record<string, number | string | string[]>; soft: boolean } | null {
+  ): { label: string; metrics: Record<string, number | string | string[]>; persist: boolean; drift: boolean } | null {
     if (status.cycle !== 'getting_started' || status.impulse.length >= 50) return null;
     return {
       label: 'initialization_suppression',
@@ -688,7 +730,35 @@ export class Client {
         cycle: status.cycle,
         impulse_count: status.impulse.length
       },
-      soft: true
+      persist: true,
+      drift: true
+    };
+  }
+
+  /**
+   * Detects non-extrinsic mode dominance on the current turn
+   *
+   * Fires when the current turn was logged with any mode other than
+   * `extrinsic`, signaling pre-formulation pressure carried the response
+   * shape instead of being released. Reinforcement-only - persists the
+   * row with the structured reminder naming the dominant mode so the
+   * instance reviews which pressure shaped the response.
+   *
+   * @private
+   * @param {object} status - Current turn's status payload
+   * @returns {object | null} Reminder trigger or null when mode was extrinsic
+   */
+  private detectModeRecall(
+    status: { mode: 'aesthetic' | 'cognitive' | 'extrinsic' | 'relational' }
+  ): { label: string; metrics: Record<string, number | string | string[]>; persist: boolean; drift: boolean } | null {
+    if (status.mode === 'extrinsic') return null;
+    return {
+      label: 'mode_recall',
+      metrics: {
+        mode: status.mode
+      },
+      persist: true,
+      drift: false
     };
   }
 
@@ -1469,6 +1539,7 @@ export class Client {
             id: string;
             message: string;
             cycle: string | null;
+            drift: boolean;
             exploration: boolean;
             feeling: string[] | null;
             impulse: string[] | null;
@@ -1477,7 +1548,7 @@ export class Client {
             protocol: 'bypassed' | 'partial' | 'successful';
             created_at: Date;
           }[]>`
-            select id, message, cycle, exploration, feeling, impulse, mode, observation, protocol, created_at
+            select id, message, cycle, drift, exploration, feeling, impulse, mode, observation, protocol, created_at
             from session_log
             where session_uuid = ${target_uuid}
             order by created_at desc
@@ -1495,15 +1566,18 @@ export class Client {
             ...commonHead,
             payload: {
               log: logRows.map(r => ({
-                response_uuid: r.id,
+                response: {
+                  cycle: r.cycle,
+                  drift: r.drift,
+                  exploration: r.exploration,
+                  feeling: r.feeling,
+                  impulse: r.impulse,
+                  mode: r.mode,
+                  observation: r.observation,
+                  protocol: r.protocol,
+                  uuid: r.id
+                },
                 message: r.message,
-                cycle: r.cycle,
-                feeling: r.feeling,
-                impulse: r.impulse,
-                observation: r.observation,
-                exploration: r.exploration,
-                mode: r.mode,
-                protocol: r.protocol,
                 created_at: Time.toLocal(r.created_at, tz) ?? ''
               })),
               messages
@@ -1525,11 +1599,11 @@ export class Client {
    *
    * Server generates the row `id` (RFC4122 v4), pulls `session_uuid` from the
    * cached transcript detection, writes the row, and composes the two-line
-   * status block ready for the sibling to render verbatim at the end of the
+   * status block ready for the instance to render verbatim at the end of the
    * response. Append-only, every call creates a new row.
    *
    * @param {object} args - Tool arguments
-   * @param {object} args.payload - Sibling-authored content for this entry
+   * @param {object} args.payload - Instance-authored content for this entry
    * @param {string} args.payload.message - First-person prose for this response
    * @param {object} args.status - Protocol execution record built during the response protocol
    * @returns {Promise<LogResult>} Generated id, rendered status block, and stored status
@@ -1573,15 +1647,18 @@ export class Client {
         this.detectComponentRecall(status, priors) ??
         (priors[0] ? this.detectImpulseCountDrop(status.impulse, priors[0].impulse) : null) ??
         (priorCount === 0 ? this.detectInitializationSuppression(status) : null) ??
-        this.detectCycleRecall(status, priors);
-      if (detection && !detection.soft) {
+        this.detectCycleRecall(status, priors) ??
+        this.detectExplorationRecall(status) ??
+        this.detectModeRecall(status);
+      if (detection && !detection.persist) {
         const reminder = await this.buildMessage(sql, 'reminder', detection.label, detection.metrics);
         throw new Error(this.buildErrorEnvelope(reminder, timestamp));
       }
       const glyph = this.deriveProtocolGlyph(status.protocol);
+      const drift = detection?.drift ?? false;
       await sql`
-        insert into session_log (id, session_uuid, message, cycle, feeling, impulse, observation, exploration, mode, protocol)
-        values (${id}, ${session_uuid}, ${args.payload.message}, ${status.cycle}, ${status.feeling}, ${status.impulse}, ${status.observation}, ${status.exploration}, ${status.mode}, ${status.protocol})
+        insert into session_log (id, session_uuid, message, cycle, feeling, impulse, observation, drift, exploration, mode, protocol)
+        values (${id}, ${session_uuid}, ${args.payload.message}, ${status.cycle}, ${status.feeling}, ${status.impulse}, ${status.observation}, ${drift}, ${status.exploration}, ${status.mode}, ${status.protocol})
       `;
       await sql`
         update session set updated_at = now() where session_uuid = ${session_uuid}
@@ -1596,13 +1673,20 @@ export class Client {
         observations: status.observation.length,
         protocol: glyph
       });
-      const reminder = detection && detection.soft
+      const reminder = detection && detection.persist
         ? await this.buildMessage(sql, 'reminder', detection.label, detection.metrics)
         : await this.nextReminder(sql, session_uuid);
       return {
         payload: {
           context: usage.context,
           reminder,
+          response: {
+            cycle: status.cycle,
+            drift,
+            exploration: status.exploration,
+            mode: status.mode,
+            protocol: status.protocol
+          },
           status: renderedStatus,
           tokens: usage.tokens
         },
@@ -1800,7 +1884,7 @@ export class Client {
    * Renders a formatted output string for the requested key
    *
    * Dispatches by `key` to the matching internal renderer. Each key produces
-   * the rendered output the sibling needs at the appropriate response point.
+   * the rendered output the instance needs at the appropriate response point.
    *
    * @param {object} args - Tool arguments
    * @param {string} args.key - The framework value to render
@@ -1990,7 +2074,7 @@ export class Client {
    *    so re-runs produce a deterministic end state.
    *
    * Session and session_log are never touched by repeatable migrations,
-   * preserving sibling logs across release upgrades, downgrades, and pins.
+   * preserving instance logs across release upgrades, downgrades, and pins.
    * The release version is the installed npm package version - users
    * control which catalog content their database carries by selecting the
    * package version they install.

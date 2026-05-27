@@ -240,7 +240,7 @@ export class Mcp {
   /**
    * Builds an output payload for tool responses with structured content
    *
-   * Prepends the tool's `action` classification from `toolActions` so siblings
+   * Prepends the tool's `action` classification from `toolActions` so instances
    * can branch on observe vs act when consuming responses, then JSON-encodes
    * the merged payload into both the text content envelope and the typed
    * `structuredContent` field.

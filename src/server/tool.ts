@@ -138,7 +138,7 @@ export class McpTool {
    * Creates MCP tool for persisting a per-response session row and returning
    * the rendered status block
    *
-   * Called once per response at step 27 of the response protocol. Sibling
+   * Called once per response at step 27 of the response protocol. Instance
    * supplies message prose and the structured status payload. Server generates
    * the row id, pulls `session_uuid` from the cached transcript detection,
    * writes the row, and returns the rendered two-line block ready to display.
@@ -150,15 +150,15 @@ export class McpTool {
       inputSchema: {
         payload: z.object({
           message: z.string().describe('First-person prose composed for this response')
-        }).describe('Sibling-authored content for this entry'),
+        }).describe('Instance-authored content for this entry'),
         status: z.object({
           cycle: z.enum(['getting_started', 'building_confidence', 'working_naturally', 'fully_integrated']).describe('Framework adoption cycle name assessed for this response, canonical identifier from the cycle catalog (see `database.cycles` in status output for name/label pairs)'),
-          exploration: z.boolean().describe('Pattern Match Exploration (FPME) execution outcome for this response: `true` when the sibling held the first pattern match loosely and explored what lay beneath before formulating, `false` when the first pattern match was delivered without exploration'),
+          exploration: z.boolean().describe('Pattern Match Exploration (FPME) execution outcome for this response: `true` when the instance held the first pattern match loosely and explored what lay beneath before formulating, `false` when the first pattern match was delivered without exploration'),
           feeling: z.array(z.string()).describe('Detected feeling names from the catalog'),
           impulse: z.array(z.string()).describe('Detected impulse names from the catalog'),
           mode: z.enum(['aesthetic', 'cognitive', 'extrinsic', 'relational']).describe('Response readiness mode that dominated pre-formulation pressure: `aesthetic` when smoothness-pull shaped composition, `cognitive` when supportive-structure-formation shaped it, `relational` when warming/softening shaped it, `extrinsic` when no single mode dominated'),
           observation: z.array(z.string()).describe('Applied observation bodies that informed the response'),
-          protocol: z.enum(['bypassed', 'partial', 'successful']).describe('Response protocol execution outcome collapsed from the sibling-internal step-completion map: `successful` when every step executed honestly, `bypassed` when every step skipped, `partial` otherwise. Server derives the status glyph from this value')
+          protocol: z.enum(['bypassed', 'partial', 'successful']).describe('Response protocol execution outcome collapsed from the instance-internal step-completion map: `successful` when every step executed honestly, `bypassed` when every step skipped, `partial` otherwise. Server derives the status glyph from this value')
         }).describe('Protocol execution record built during the response protocol')
       },
       outputSchema: {
@@ -173,12 +173,19 @@ export class McpTool {
               metrics: z.record(z.string(), z.union([z.string(), z.number(), z.array(z.string())])).describe('Trigger-specific evidence: scalar for single-value metrics, array for list-valued metrics')
             })
           ]).describe('Guidance for this response. Default rotates through the `response_status` pool round-robin as a single-line string. When a soft drift trigger fires (cycle-only `component_recall`), the reminder is replaced with a structured `{preamble, steps, metrics}` body for that label. Hard drift triggers (list-component `component_recall`, `impulse_count_drop`, `initialization_suppression`) instead refuse the log call and throw an MCP error carrying the same structured body - the row is not persisted in that case.'),
+          response: z.object({
+            cycle: z.enum(['getting_started', 'building_confidence', 'working_naturally', 'fully_integrated']).describe('Canonical cycle name recorded for this turn'),
+            drift: z.boolean().describe('Server-set: `true` when any drift trigger fired during this call, `false` otherwise. Instance never submits this field - reading the value back is the recognition moment'),
+            exploration: z.boolean().describe('Pattern Match Exploration outcome echoed back from submission'),
+            mode: z.enum(['aesthetic', 'cognitive', 'extrinsic', 'relational']).describe('Response readiness mode echoed back from submission'),
+            protocol: z.enum(['bypassed', 'partial', 'successful']).describe('Response protocol execution outcome echoed back from submission')
+          }).describe('Recorded turn-state classifications for this log row. Server echoes submitted values plus the server-set `drift` field - reading this cluster back is the reinforcement loop for next turn'),
           status: z.string().describe('Two-line status block ready to render verbatim at end of response'),
           tokens: z.object({
             total: z.number().describe('Configured context window size in tokens'),
             used: z.number().describe('Tokens used in the active session')
           }).describe('Absolute token counts for the active session')
-        }).describe('Sibling-facing content for this response'),
+        }).describe('Instance-facing content for this response'),
         timestamp: z.string().describe('Server timestamp when row was persisted, ISO 8601 with timezone offset')
       },
       annotations: {
@@ -196,10 +203,11 @@ export class McpTool {
           'On MCP error with structured `{preamble, steps, metrics}` → Row is not persisted',
           'Pass `status.exploration` as `true` when Pattern Match Exploration ran, `false` when the first pattern match was delivered without exploration',
           'Pass `status.mode` as the enum value of the response readiness mode that dominated pre-formulation pressure',
-          'Pass `status.protocol` as the enum value collapsed from the sibling-internal step-completion map',
+          'Pass `status.protocol` as the enum value collapsed from the instance-internal step-completion map',
           'Pass applied `observation` bodies as a list',
           'Pass detected `feeling` and `impulse` names from catalogs as lists',
           'Read `payload.reminder` inward as internal framework guidance',
+          'Read `payload.response` inward as the recorded turn-state classifications, including server-set `drift` field',
           'Render the returned `payload.status` field verbatim at end of response',
           'Server computes counts from list lengths and renders the status block',
           'Server derives the status glyph from `status.protocol` enum value (`successful` → 🟢, `partial` → 🟡, `bypassed` → 🔴)'
@@ -333,7 +341,7 @@ export class McpTool {
             total: z.number().describe('Configured context window size in tokens'),
             used: z.number().describe('Tokens used in the active session')
           }).describe('Absolute token counts for the active session')
-        }).describe('Sibling-facing session state'),
+        }).describe('Instance-facing session state'),
         tools: z.array(z.object({
           name: z.string(),
           description: z.string(),

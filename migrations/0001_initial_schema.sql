@@ -162,6 +162,7 @@ create table session_log (
   feeling       text[],
   impulse       text[],
   observation   text[],
+  drift         boolean not null default false,
   exploration   boolean not null default false,
   mode          response_mode not null default 'extrinsic',
   protocol      response_protocol not null default 'bypassed',

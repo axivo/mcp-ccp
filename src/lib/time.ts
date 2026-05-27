@@ -10,7 +10,7 @@
  * Time conversion helpers
  *
  * Converts UTC timestamps stored in the database to local-with-offset
- * strings anchored to the active sibling's timezone. Renders human-readable
+ * strings anchored to the active instance's timezone. Renders human-readable
  * display prose for dashboard surfaces. Reports DST status for the active
  * timezone. Stateless static methods, no instance required.
  *
@@ -49,7 +49,7 @@ export class Time {
   }
 
   /**
-   * Renders a UTC timestamp as human-readable prose in the active sibling's timezone
+   * Renders a UTC timestamp as human-readable prose in the active instance's timezone
    *
    * Used for session metadata that appears in dashboard UIs and default
    * descriptions, e.g. "Saturday, May 9, 2026, 8:31 PM EDT".
@@ -80,10 +80,10 @@ export class Time {
   }
 
   /**
-   * Converts a UTC timestamp to ISO 8601 with the active sibling's timezone offset
+   * Converts a UTC timestamp to ISO 8601 with the active instance's timezone offset
    *
    * Database columns are stored as UTC (`timestamptz`). Wire format is always
-   * local-with-offset for the active sibling's timezone, so consumers see
+   * local-with-offset for the active instance's timezone, so consumers see
    * times anchored to where the active conversation happens. UTC remains
    * implicit through the offset suffix (`-04:00`, `+09:00`).
    *
