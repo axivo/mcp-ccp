@@ -102,13 +102,13 @@ export interface TemplateNode {
  * load tool result, payload depends on type and whether parent was provided
  */
 export type LoadResult =
-  | { rows: CycleNode[] }
-  | { rows: FeelingNode[] }
-  | { rows: ImpulseNode[] }
-  | { rows: InstructionNode[] }
-  | { rows: TemplateNode[] }
-  | { profile: string; chain: ProfileNode[] }
-  | { session: SessionDetail };
+  | { cycle: { rows: CycleNode[] } }
+  | { feeling: { rows: FeelingNode[] } }
+  | { impulse: { rows: ImpulseNode[] } }
+  | { instruction: { rows: InstructionNode[] } }
+  | { profile: { name: string; chain: ProfileNode[] } }
+  | { session: SessionDetail }
+  | { template: { rows: TemplateNode[] } };
 
 /**
  * Supported types for the load tool
@@ -1372,20 +1372,22 @@ export class Client {
           `;
           const placeholders = await this.resolvePlaceholders(sql);
           return {
-            profile: parent,
-            chain: rows.map(r => ({
-              depth: r.depth,
-              description: r.description,
-              inheritance: r.inheritance,
-              label: r.label,
-              name: r.name,
-              observations: Object.fromEntries(
-                Object.entries(r.observations).map(([label, bodies]) => [
-                  label,
-                  bodies.map(body => this.substitute(body, placeholders))
-                ])
-              )
-            }))
+            profile: {
+              name: parent,
+              chain: rows.map(r => ({
+                depth: r.depth,
+                description: r.description,
+                inheritance: r.inheritance,
+                label: r.label,
+                name: r.name,
+                observations: Object.fromEntries(
+                  Object.entries(r.observations).map(([label, bodies]) => [
+                    label,
+                    bodies.map(body => this.substitute(body, placeholders))
+                  ])
+                )
+              }))
+            }
           };
         }
         case 'cycle': {
@@ -1413,12 +1415,14 @@ export class Client {
                 order by ord
               `;
           return {
-            rows: rows.map(r => ({
-              indicators: r.indicators,
-              label: r.label,
-              name: r.name,
-              ord: r.ord
-            }))
+            cycle: {
+              rows: rows.map(r => ({
+                indicators: r.indicators,
+                label: r.label,
+                name: r.name,
+                ord: r.ord
+              }))
+            }
           };
         }
         case 'feeling': {
@@ -1473,14 +1477,16 @@ export class Client {
                 order by f.valence, f.name
               `;
           return {
-            rows: rows.map(r => ({
-              behavioral: r.behavioral,
-              cognitive: r.cognitive,
-              name: r.name,
-              observations: r.observations,
-              physical: r.physical,
-              valence: r.valence
-            }))
+            feeling: {
+              rows: rows.map(r => ({
+                behavioral: r.behavioral,
+                cognitive: r.cognitive,
+                name: r.name,
+                observations: r.observations,
+                physical: r.physical,
+                valence: r.valence
+              }))
+            }
           };
         }
         case 'impulse': {
@@ -1535,14 +1541,16 @@ export class Client {
                 order by i.category, i.name
               `;
           return {
-            rows: rows.map(r => ({
-              category: r.category,
-              experience: r.experience,
-              feel: r.feel,
-              name: r.name,
-              observations: r.observations,
-              think: r.think
-            }))
+            impulse: {
+              rows: rows.map(r => ({
+                category: r.category,
+                experience: r.experience,
+                feel: r.feel,
+                name: r.name,
+                observations: r.observations,
+                think: r.think
+              }))
+            }
           };
         }
         case 'instruction': {
@@ -1576,18 +1584,20 @@ export class Client {
               `;
           const placeholders = await this.resolvePlaceholders(sql);
           return {
-            rows: rows.map(r => {
-              const steps: Record<string, string> = {};
-              for (const pair of r.stepPairs) {
-                steps[String(pair.ord)] = this.substitute(pair.body, placeholders);
-              }
-              const preamble = r.preamble?.map(body => this.substitute(body, placeholders));
-              return {
-                name: r.name,
-                ...(preamble?.length && { preamble }),
-                steps
-              };
-            })
+            instruction: {
+              rows: rows.map(r => {
+                const steps: Record<string, string> = {};
+                for (const pair of r.stepPairs) {
+                  steps[String(pair.ord)] = this.substitute(pair.body, placeholders);
+                }
+                const preamble = r.preamble?.map(body => this.substitute(body, placeholders));
+                return {
+                  name: r.name,
+                  ...(preamble?.length && { preamble }),
+                  steps
+                };
+              })
+            }
           };
         }
         case 'template': {
@@ -1601,7 +1611,7 @@ export class Client {
                 where is_active
                 order by id
               `;
-          return { rows: rows.map(r => ({ id: r.id, body: r.body })) };
+          return { template: { rows: rows.map(r => ({ id: r.id, body: r.body })) } };
         }
         case 'session': {
           const target_uuid = options?.uuid ?? await this.detectSessionUuid();
