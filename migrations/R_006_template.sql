@@ -394,4 +394,4 @@ Use the following format when referencing framework documentation links:
 >
 > Verify the referenced links before writing.
 $diary_template_body$),
-  ('status', '┃ {glyph} **{cycle_label}** ○ {context_pct}% ○ {feeling_count} {feeling_noun} ○ {impulse_count} {impulse_noun} ○ {observation_count} {observation_noun}');
+  ('status', '┃ {{glyph}} **{{cycle_label}}** ○ {{context_pct}}% ○ {{feeling_count}} {{feeling_noun}} ○ {{impulse_count}} {{impulse_noun}} ○ {{observation_count}} {{observation_noun}}');

@@ -793,7 +793,7 @@ export class Client {
     sql: postgres.Sql
   ): Promise<{ label: string; metrics: Record<string, number | string | string[]>; persist: boolean; drift: boolean } | null> {
     const template = await this.getStatusTemplate(sql);
-    const prefix = template.split('{')[0] ?? '';
+    const prefix = template.split('{{')[0] ?? '';
     const session_uuid = await this.detectSessionUuid();
     if (!session_uuid) return null;
     const transcriptPath = join(this.getTranscriptDir(), `${session_uuid}.jsonl`);
@@ -1977,7 +1977,7 @@ export class Client {
       observation_count: String(status.observations),
       observation_noun: status.observations === 1 ? 'observation' : 'observations'
     };
-    return template.replace(/\{(\w+)\}/g, (_, key) => substitutions[key] ?? `{${key}}`);
+    return template.replace(/\{\{(\w+)\}\}/g, (_, key) => substitutions[key] ?? `{{${key}}}`);
   }
 
   /**
@@ -1997,7 +1997,7 @@ export class Client {
       select body from template where id = 'status' and is_active
     `;
     if (!row) throw new Error('Status template not found in template table');
-    const prefix = row.body.split('{')[0] ?? '';
+    const prefix = row.body.split('{{')[0] ?? '';
     if (prefix.length === 0) {
       throw new Error('Status template must start with a literal prefix before the first placeholder');
     }
