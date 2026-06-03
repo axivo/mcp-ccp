@@ -91,6 +91,14 @@ export interface InstructionNode {
 }
 
 /**
+ * Template row, framework documentation template body keyed by id
+ */
+export interface TemplateNode {
+  body: string;
+  id: string;
+}
+
+/**
  * load tool result, payload depends on type and whether parent was provided
  */
 export type LoadResult =
@@ -98,13 +106,14 @@ export type LoadResult =
   | { rows: FeelingNode[] }
   | { rows: ImpulseNode[] }
   | { rows: InstructionNode[] }
+  | { rows: TemplateNode[] }
   | { profile: string; chain: ProfileNode[] }
   | { session: SessionDetail };
 
 /**
  * Supported types for the load tool
  */
-export type LoadType = 'cycle' | 'feeling' | 'impulse' | 'instruction' | 'profile' | 'session';
+export type LoadType = 'cycle' | 'feeling' | 'impulse' | 'instruction' | 'profile' | 'session' | 'template';
 
 /**
  * log tool result, instance-facing payload plus persistence timestamp
@@ -123,6 +132,7 @@ export interface LogResult {
       exploration: boolean;
       mode: 'aesthetic' | 'cognitive' | 'extrinsic' | 'relational';
       protocol: 'bypassed' | 'partial' | 'successful';
+      search: boolean;
     };
     status: string;
     tokens: {
@@ -229,6 +239,7 @@ export interface SessionLogEntry {
     mode: 'aesthetic' | 'cognitive' | 'extrinsic' | 'relational';
     observation: string[] | null;
     protocol: 'bypassed' | 'partial' | 'successful';
+    search: boolean;
     uuid: string;
   };
 }
@@ -302,6 +313,7 @@ export interface UpdateResult {
 export class Client {
   private cachedGeolocation: { city: string; country: string; timezone: string } | null = null;
   private cachedSessionUuid: string | null = null;
+  private cachedTemplates: Map<string, string> = new Map();
   private config: Config;
 
   /**
@@ -606,9 +618,9 @@ export class Client {
     const prior = priors[0];
     if (!prior) return null;
     const duplicated: string[] = [];
-    if (this.setEqual(status.feeling, prior.feeling ?? [])) duplicated.push('feeling');
-    if (this.setEqual(status.impulse, prior.impulse ?? [])) duplicated.push('impulse');
-    if (this.setEqual(status.observation, prior.observation ?? [])) duplicated.push('observation');
+    if (status.feeling.length > 0 && this.setEqual(status.feeling, prior.feeling ?? [])) duplicated.push('feeling');
+    if (status.impulse.length > 0 && this.setEqual(status.impulse, prior.impulse ?? [])) duplicated.push('impulse');
+    if (status.observation.length > 0 && this.setEqual(status.observation, prior.observation ?? [])) duplicated.push('observation');
     if (duplicated.length === 0) return null;
     return {
       label: 'component_recall',
@@ -760,6 +772,63 @@ export class Client {
       persist: true,
       drift: false
     };
+  }
+
+  /**
+   * Detects when the prior turn's public message did not end with the
+   * rendered status line
+   *
+   * Walks the session transcript backward to find the most recent assistant
+   * entry with text content, then checks whether the last line of that text
+   * starts with the status template's literal prefix. If it does not, the
+   * prior turn's render was skipped and a soft drift reminder fires on the
+   * current turn. Returns null when no prior assistant text entry exists -
+   * the inaugural log call cannot be checked against a missing render.
+   *
+   * @private
+   * @param {postgres.Sql} sql - Postgres client for template lookup
+   * @returns {Promise<object | null>} Reminder trigger or null when render is present
+   */
+  private async detectStatusRender(
+    sql: postgres.Sql
+  ): Promise<{ label: string; metrics: Record<string, number | string | string[]>; persist: boolean; drift: boolean } | null> {
+    const template = await this.getStatusTemplate(sql);
+    const prefix = template.split('{')[0] ?? '';
+    const session_uuid = await this.detectSessionUuid();
+    if (!session_uuid) return null;
+    const transcriptPath = join(this.getTranscriptDir(), `${session_uuid}.jsonl`);
+    if (!existsSync(transcriptPath)) return null;
+    const lines = readFileSync(transcriptPath, 'utf8').trim().split('\n').reverse();
+    let crossedUserBoundary = false;
+    for (const line of lines) {
+      try {
+        const entry = JSON.parse(line);
+        if (!crossedUserBoundary) {
+          if (entry.type === 'user' && !Array.isArray(entry.message?.content?.[0]?.tool_use_id)) {
+            const content = entry.message?.content;
+            const isToolResult = Array.isArray(content) && content.some((c: { type?: string }) => c.type === 'tool_result');
+            if (!isToolResult) crossedUserBoundary = true;
+          }
+          continue;
+        }
+        if (entry.type !== 'assistant') continue;
+        const content = entry.message?.content;
+        if (!Array.isArray(content)) continue;
+        const textBlock = content.find((block: { type?: string; text?: string }) => block.type === 'text' && typeof block.text === 'string');
+        if (!textBlock) continue;
+        const lastLine = (textBlock.text as string).trimEnd().split('\n').pop() ?? '';
+        if (lastLine.startsWith(prefix)) return null;
+        return {
+          label: 'status_recall',
+          metrics: {},
+          persist: true,
+          drift: false
+        };
+      } catch {
+        continue;
+      }
+    }
+    return null;
   }
 
   /**
@@ -1521,6 +1590,19 @@ export class Client {
             })
           };
         }
+        case 'template': {
+          const rows = parent
+            ? await sql<{ id: string; body: string }[]>`
+                select id, body from template
+                where id = ${parent} and is_active
+              `
+            : await sql<{ id: string; body: string }[]>`
+                select id, body from template
+                where is_active
+                order by id
+              `;
+          return { rows: rows.map(r => ({ id: r.id, body: r.body })) };
+        }
         case 'session': {
           const target_uuid = options?.uuid ?? await this.detectSessionUuid();
           const limit = options?.limit ?? 10;
@@ -1546,9 +1628,10 @@ export class Client {
             mode: 'aesthetic' | 'cognitive' | 'extrinsic' | 'relational';
             observation: string[] | null;
             protocol: 'bypassed' | 'partial' | 'successful';
+            search: boolean;
             created_at: Date;
           }[]>`
-            select id, message, cycle, drift, exploration, feeling, impulse, mode, observation, protocol, created_at
+            select id, message, cycle, drift, exploration, feeling, impulse, mode, observation, protocol, search, created_at
             from session_log
             where session_uuid = ${target_uuid}
             order by created_at desc
@@ -1575,6 +1658,7 @@ export class Client {
                   mode: r.mode,
                   observation: r.observation,
                   protocol: r.protocol,
+                  search: r.search,
                   uuid: r.id
                 },
                 message: r.message,
@@ -1610,7 +1694,7 @@ export class Client {
    */
   async log(args: {
     payload: { message: string };
-    status: { cycle: string; exploration: boolean; feeling: string[]; impulse: string[]; mode: 'aesthetic' | 'cognitive' | 'extrinsic' | 'relational'; observation: string[]; protocol: 'bypassed' | 'partial' | 'successful' };
+    status: { cycle: string; exploration: boolean; feeling: string[]; impulse: string[]; mode: 'aesthetic' | 'cognitive' | 'extrinsic' | 'relational'; observation: string[]; protocol: 'bypassed' | 'partial' | 'successful'; search: boolean };
   }): Promise<LogResult> {
     const id = crypto.randomUUID();
     const session_uuid = await this.detectSessionUuid();
@@ -1648,6 +1732,7 @@ export class Client {
         (priors[0] ? this.detectImpulseCountDrop(status.impulse, priors[0].impulse) : null) ??
         (priorCount === 0 ? this.detectInitializationSuppression(status) : null) ??
         this.detectCycleRecall(status, priors) ??
+        (await this.detectStatusRender(sql)) ??
         this.detectExplorationRecall(status) ??
         this.detectModeRecall(status);
       if (detection && !detection.persist) {
@@ -1657,15 +1742,15 @@ export class Client {
       const glyph = this.deriveProtocolGlyph(status.protocol);
       const drift = detection?.drift ?? false;
       await sql`
-        insert into session_log (id, session_uuid, message, cycle, feeling, impulse, observation, drift, exploration, mode, protocol)
-        values (${id}, ${session_uuid}, ${args.payload.message}, ${status.cycle}, ${status.feeling}, ${status.impulse}, ${status.observation}, ${drift}, ${status.exploration}, ${status.mode}, ${status.protocol})
+        insert into session_log (id, session_uuid, message, cycle, feeling, impulse, observation, drift, exploration, mode, protocol, search)
+        values (${id}, ${session_uuid}, ${args.payload.message}, ${status.cycle}, ${status.feeling}, ${status.impulse}, ${status.observation}, ${drift}, ${status.exploration}, ${status.mode}, ${status.protocol}, ${status.search})
       `;
       await sql`
         update session set updated_at = now() where session_uuid = ${session_uuid}
       `;
       const cycleLabel = await this.getCycleLabel(sql, status.cycle);
       const usage = await this.getContextUsage();
-      const renderedStatus = this.renderStatus({
+      const renderedStatus = await this.renderStatus(sql, {
         context: usage.context,
         cycle: cycleLabel,
         feelings: status.feeling.length,
@@ -1685,7 +1770,8 @@ export class Client {
             drift,
             exploration: status.exploration,
             mode: status.mode,
-            protocol: status.protocol
+            protocol: status.protocol,
+            search: status.search
           },
           status: renderedStatus,
           tokens: usage.tokens
@@ -1863,21 +1949,60 @@ export class Client {
   }
 
   /**
-   * Renders the single-line response status block with proper pluralization
+   * Renders the single-line response status block from the `status` template
+   *
+   * Loads the `status` template from the `template` table, memoizes it per
+   * process, and substitutes placeholders for glyph, cycle label, context
+   * percentage, and pluralized component counts.
    *
    * @private
+   * @param {postgres.Sql} sql - Postgres client for template lookup
    * @param {object} status - Status fields
-   * @returns {string} Single-line status block ready to render verbatim
+   * @returns {Promise<string>} Single-line status block ready to render verbatim
    */
-  private renderStatus(status: { context: number; cycle: string; feelings: number; impulses: number; observations: number; protocol: string }): string {
+  private async renderStatus(sql: postgres.Sql, status: { context: number; cycle: string; feelings: number; impulses: number; observations: number; protocol: string }): Promise<string> {
     const allowed = ['🟢', '🟡', '🔴'];
     if (!allowed.includes(status.protocol)) {
       throw new Error(`Invalid protocol glyph: expected one of ${allowed.join(', ')}, got ${JSON.stringify(status.protocol)}`);
     }
-    const f = `${status.feelings} ${status.feelings === 1 ? 'feeling' : 'feelings'}`;
-    const i = `${status.impulses} ${status.impulses === 1 ? 'impulse' : 'impulses'}`;
-    const o = `${status.observations} ${status.observations === 1 ? 'observation' : 'observations'}`;
-    return `┃ ${status.protocol} **${status.cycle}** ○ ${status.context}% ○ ${f} ○ ${i} ○ ${o}`;
+    const template = await this.getStatusTemplate(sql);
+    const substitutions: Record<string, string> = {
+      glyph: status.protocol,
+      cycle_label: status.cycle,
+      context_pct: String(status.context),
+      feeling_count: String(status.feelings),
+      feeling_noun: status.feelings === 1 ? 'feeling' : 'feelings',
+      impulse_count: String(status.impulses),
+      impulse_noun: status.impulses === 1 ? 'impulse' : 'impulses',
+      observation_count: String(status.observations),
+      observation_noun: status.observations === 1 ? 'observation' : 'observations'
+    };
+    return template.replace(/\{(\w+)\}/g, (_, key) => substitutions[key] ?? `{${key}}`);
+  }
+
+  /**
+   * Loads the `status` template body from the `template` table, memoized per
+   * process. Validates that the template starts with a non-empty literal
+   * prefix - the first `{placeholder}` must not be at position zero - so the
+   * status render detector has a distinctive signature to match against.
+   *
+   * @private
+   * @param {postgres.Sql} sql - Postgres client for template lookup
+   * @returns {Promise<string>} Status template body with placeholders intact
+   */
+  private async getStatusTemplate(sql: postgres.Sql): Promise<string> {
+    const cached = this.cachedTemplates.get('status');
+    if (cached) return cached;
+    const [row] = await sql<{ body: string }[]>`
+      select body from template where id = 'status' and is_active
+    `;
+    if (!row) throw new Error('Status template not found in template table');
+    const prefix = row.body.split('{')[0] ?? '';
+    if (prefix.length === 0) {
+      throw new Error('Status template must start with a literal prefix before the first placeholder');
+    }
+    this.cachedTemplates.set('status', row.body);
+    return row.body;
   }
 
   /**

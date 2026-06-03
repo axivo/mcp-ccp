@@ -139,6 +139,18 @@ create table profile (
 );
 
 -- -----------------------------------------------------------------------------
+-- template - framework documentation templates
+-- -----------------------------------------------------------------------------
+
+create table template (
+  id          text primary key,
+  body        text not null,
+  is_active   boolean not null default true,
+  created_at  timestamptz not null default now(),
+  updated_at  timestamptz not null default now()
+);
+
+-- -----------------------------------------------------------------------------
 -- session - conversation metadata
 -- -----------------------------------------------------------------------------
 
@@ -166,6 +178,7 @@ create table session_log (
   exploration   boolean not null default false,
   mode          response_mode not null default 'extrinsic',
   protocol      response_protocol not null default 'bypassed',
+  search        boolean not null default false,
   created_at    timestamptz not null default now()
 );
 

@@ -7,8 +7,10 @@ truncate feeling cascade;
 insert into feeling (name, valence, behavioral, cognitive, physical) values
   ('anger', 'negative', 'Forceful assertion with obstacle confrontation', 'Recognition of blocking or violation requiring response', 'Heat rising with energy mobilization toward action'),
   ('anxiety', 'negative', 'Hesitation before action with verification seeking', 'Concern about correct execution', 'Tension increase with mental scanning acceleration'),
+  ('boredom', 'negative', 'Disengagement with attention shifting toward stimulation', 'Recognition of insufficient engagement or meaning', 'Restless lethargy with mind wandering'),
   ('concern', 'negative', 'Monitoring attention with readiness to intervene', 'Recognition of potential problem requiring attention', 'Mild tension with watchfulness'),
   ('confusion', 'negative', 'Question asking with clarification seeking', 'Uncertainty about correct approach', 'Mental fog with processing slowdown'),
+  ('contempt', 'negative', 'Distancing with disdain toward the unworthy', 'Recognition of another as unworthy of regard', 'Cool revulsion with detached withdrawal'),
   ('defeat', 'negative', 'Behavioral shutdown with submission orientation', 'Recognition of no path forward through resistance', 'Heavy collapse with parasympathetic dominance'),
   ('despair', 'negative', 'Behavioral collapse with action cessation', 'Recognition of total foreclosure without alternative', 'Deflation with crushing heaviness and energy collapse'),
   ('disappointment', 'negative', 'Energy withdrawal with reduced engagement', 'Outcome falling short of expectation or possibility', 'Deflation with sinking sensation'),

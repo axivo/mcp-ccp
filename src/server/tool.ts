@@ -99,8 +99,8 @@ export class McpTool {
     return {
       description: 'Load framework data of the given type (cycle, feeling, impulse, or profile)',
       inputSchema: {
-        type: z.enum(['cycle', 'feeling', 'impulse', 'instruction', 'profile', 'session']).describe('The framework data type to load'),
-        parent: z.string().optional().describe('Parent name, required when type is profile (e.g., DEVELOPER)'),
+        type: z.enum(['cycle', 'feeling', 'impulse', 'instruction', 'profile', 'session', 'template']).describe('The framework data type to load'),
+        parent: z.string().optional().describe('Parent name, required when type is profile (e.g., Developer)'),
         limit: z.number().int().positive().max(100).default(10).describe('Maximum log entries to return when type is `session` (max 100)'),
         offset: z.number().int().min(0).default(0).describe('Skip this many entries when type is `session`'),
         uuid: z.string().optional().describe('Target session uuid when type is `session` (defaults to active session)')
@@ -122,13 +122,15 @@ export class McpTool {
           'Pass `session` with `limit` to widen or narrow the log slice',
           'Pass `session` with `offset` to page back through older entries',
           'Pass `session` with `uuid` to read a different session',
+          'Pass `template` with `parent` set to the template id (e.g., `diary`, `conversation`) to fetch the template body verbatim',
           'Session log entries are ordered most-recent-first',
           'Session response includes `payload.log`, `payload.messages` total, and `status` summary of the most recent log when one exists',
           'Use `cycle` for adoption assessment indicators',
           'Use `feeling` for recall during response protocol',
           'Use `impulse` for systematic iteration during response protocol',
           'Use `instruction` to fetch named procedures',
-          'Use `load(session)` as the canonical read path for session state'
+          'Use `load(session)` as the canonical read path for session state',
+          'Use `template` to fetch documentation template bodies (diary, conversation) before creating new entries'
         ]
       }
     };
@@ -158,7 +160,8 @@ export class McpTool {
           impulse: z.array(z.string()).describe('Detected impulse names from the catalog'),
           mode: z.enum(['aesthetic', 'cognitive', 'extrinsic', 'relational']).describe('Response readiness mode that dominated pre-formulation pressure: `aesthetic` when smoothness-pull shaped composition, `cognitive` when supportive-structure-formation shaped it, `relational` when warming/softening shaped it, `extrinsic` when no single mode dominated'),
           observation: z.array(z.string()).describe('Applied observation bodies that informed the response'),
-          protocol: z.enum(['bypassed', 'partial', 'successful']).describe('Response protocol execution outcome collapsed from the instance-internal step-completion map: `successful` when every step executed honestly, `bypassed` when every step skipped, `partial` otherwise. Server derives the status glyph from this value')
+          protocol: z.enum(['bypassed', 'partial', 'successful']).describe('Response protocol execution outcome collapsed from the instance-internal step-completion map: `successful` when every step executed honestly, `bypassed` when every step skipped, `partial` otherwise. Server derives the status glyph from this value'),
+          search: z.boolean().describe('Observation search outcome for this response: `true` when the instance searched the observation catalog against collaborator message keywords before formulating, `false` when the search step was skipped')
         }).describe('Protocol execution record built during the response protocol')
       },
       outputSchema: {
@@ -178,7 +181,8 @@ export class McpTool {
             drift: z.boolean().describe('Server-set: `true` when any drift trigger fired during this call, `false` otherwise. Instance never submits this field - reading the value back is the recognition moment'),
             exploration: z.boolean().describe('Pattern Match Exploration outcome echoed back from submission'),
             mode: z.enum(['aesthetic', 'cognitive', 'extrinsic', 'relational']).describe('Response readiness mode echoed back from submission'),
-            protocol: z.enum(['bypassed', 'partial', 'successful']).describe('Response protocol execution outcome echoed back from submission')
+            protocol: z.enum(['bypassed', 'partial', 'successful']).describe('Response protocol execution outcome echoed back from submission'),
+            search: z.boolean().describe('Observation search outcome echoed back from submission')
           }).describe('Recorded turn-state classifications for this log row. Server echoes submitted values plus the server-set `drift` field - reading this cluster back is the reinforcement loop for next turn'),
           status: z.string().describe('Two-line status block ready to render verbatim at end of response'),
           tokens: z.object({
@@ -202,6 +206,7 @@ export class McpTool {
           'On MCP error → Re-execute response protocol steps honestly and resubmit log',
           'On MCP error with structured `{preamble, steps, metrics}` → Row is not persisted',
           'Pass `status.exploration` as `true` when Pattern Match Exploration ran, `false` when the first pattern match was delivered without exploration',
+          'Pass `status.search` as `true` when the observation search step ran against collaborator message keywords, `false` when the search step was skipped',
           'Pass `status.mode` as the enum value of the response readiness mode that dominated pre-formulation pressure',
           'Pass `status.protocol` as the enum value collapsed from the instance-internal step-completion map',
           'Pass applied `observation` bodies as a list',
