@@ -36,11 +36,9 @@ create type issue_status as enum ('closed', 'in_progress', 'open');
 
 create type issue_tracker as enum ('custom', 'github', 'gitlab', 'jira');
 
-create type observation_type as enum ('feeling', 'impulse', 'instruction', 'payload', 'profile');
+create type observation_type as enum ('feeling', 'impulse', 'instruction', 'mode', 'payload', 'profile');
 
 create type project_status as enum ('active', 'archived');
-
-create type response_mode as enum ('aesthetic', 'cognitive', 'extrinsic', 'relational');
 
 create type response_protocol as enum ('bypassed', 'partial', 'successful');
 
@@ -97,6 +95,20 @@ create table impulse (
 );
 
 create index idx_impulse_category on impulse (category) where is_active;
+
+-- -----------------------------------------------------------------------------
+-- mode - response readiness pressures shaping composition
+-- -----------------------------------------------------------------------------
+
+create table mode (
+  name        text primary key,
+  experience  text not null,
+  feel        text not null,
+  think       text not null,
+  is_active   boolean not null default true,
+  created_at  timestamptz not null default now(),
+  updated_at  timestamptz not null default now()
+);
 
 -- -----------------------------------------------------------------------------
 -- observation - unified polymorphic data across all parent kinds
@@ -176,7 +188,7 @@ create table session_log (
   observation   text[],
   drift         boolean not null default false,
   exploration   boolean not null default false,
-  mode          response_mode not null default 'extrinsic',
+  mode          text not null default 'extrinsic' references mode (name) on update cascade,
   protocol      response_protocol not null default 'bypassed',
   search        boolean not null default false,
   created_at    timestamptz not null default now()

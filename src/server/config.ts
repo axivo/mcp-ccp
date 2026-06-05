@@ -14,6 +14,7 @@ import { z } from 'zod';
 export interface CcpConfig {
   contextWindow: number;
   database: DatabaseConfig;
+  framework: FrameworkConfig;
   geolocation: GeolocationConfig;
   mcp: McpConfig;
   status: StatusConfig;
@@ -29,6 +30,20 @@ export interface DatabaseConfig {
   port: number;
   schema: string;
   user: string;
+}
+
+/**
+ * Framework behavior settings
+ *
+ * `drift` controls how the server responds to generation detection:
+ *
+ * - `permissive` (default) - soft drift, generated entries filtered out
+ *   before persistence, reminder names what was dropped
+ * - `strict` - hard drift, log not persisted, sibling re-calls with
+ *   catalog-verified values
+ */
+export interface FrameworkConfig {
+  drift: 'permissive' | 'strict';
 }
 
 /**
@@ -79,6 +94,9 @@ export class Config {
     password: z.string().default('postgres'),
     schema: z.string().default('public')
   });
+  private static readonly FrameworkSchema = z.object({
+    drift: z.enum(['permissive', 'strict']).default('permissive')
+  });
   private static readonly GeolocationSchema = z.object({
     service: z.url().default('https://ipinfo.io/json'),
     override: z.string().optional(),
@@ -91,14 +109,16 @@ export class Config {
     service: z.url().default('https://status.claude.ai/api/v2/summary.json')
   });
   private static readonly ConfigSchema = z.object({
-    contextWindow: z.number().int().positive().default(1_000_000),
+    contextWindow: z.number().int().positive().default(1000000),
     database: Config.DatabaseSchema.optional(),
+    framework: Config.FrameworkSchema.optional(),
     geolocation: Config.GeolocationSchema.optional(),
     mcp: Config.McpSchema.optional(),
     status: Config.StatusSchema.optional()
   }).transform(data => ({
     contextWindow: data.contextWindow,
     database: data.database ?? Config.DatabaseSchema.parse({}),
+    framework: data.framework ?? Config.FrameworkSchema.parse({}),
     geolocation: data.geolocation ?? Config.GeolocationSchema.parse({}),
     mcp: data.mcp ?? Config.McpSchema.parse({}),
     status: data.status ?? Config.StatusSchema.parse({})
@@ -160,6 +180,15 @@ export class Config {
    */
   get database(): DatabaseConfig {
     return this.settings.database;
+  }
+
+  /**
+   * Returns framework behavior settings
+   *
+   * @returns {FrameworkConfig} Framework behavior settings
+   */
+  get framework(): FrameworkConfig {
+    return this.settings.framework;
   }
 
   /**

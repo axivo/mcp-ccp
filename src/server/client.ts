@@ -91,6 +91,24 @@ export interface InstructionNode {
 }
 
 /**
+ * Mode row with its first-person triple and attached observations
+ *
+ * Modes are response readiness pressures shaping composition, recognized
+ * after impulse defusion and released through the same ACT technique.
+ * The triple mirrors the impulse triple (experience/feel/think) because
+ * modes are impulses operating one layer up — pulls on composition itself
+ * rather than on behavior. `extrinsic` is the "none dominated" sentinel
+ * assigned at step 47 and does not appear as a catalog row.
+ */
+export interface ModeNode {
+  experience: string;
+  feel: string;
+  name: string;
+  observations: string[];
+  think: string;
+}
+
+/**
  * Template row, framework documentation template body keyed by id
  */
 export interface TemplateNode {
@@ -106,6 +124,7 @@ export type LoadResult =
   | { feeling: { rows: FeelingNode[] } }
   | { impulse: { rows: ImpulseNode[] } }
   | { instruction: { rows: InstructionNode[] } }
+  | { mode: { rows: ModeNode[] } }
   | { profile: { name: string; chain: ProfileNode[] } }
   | { session: SessionDetail }
   | { template: { rows: TemplateNode[] } };
@@ -113,7 +132,7 @@ export type LoadResult =
 /**
  * Supported types for the load tool
  */
-export type LoadType = 'cycle' | 'feeling' | 'impulse' | 'instruction' | 'profile' | 'session' | 'template';
+export type LoadType = 'cycle' | 'feeling' | 'impulse' | 'instruction' | 'mode' | 'profile' | 'session' | 'template';
 
 /**
  * log tool result, instance-facing payload plus persistence timestamp
@@ -130,7 +149,7 @@ export interface LogResult {
       cycle: string;
       drift: boolean;
       exploration: boolean;
-      mode: 'aesthetic' | 'cognitive' | 'extrinsic' | 'relational';
+      mode: string;
       protocol: 'bypassed' | 'partial' | 'successful';
       search: boolean;
     };
@@ -236,7 +255,7 @@ export interface SessionLogEntry {
     exploration: boolean;
     feeling: string[] | null;
     impulse: string[] | null;
-    mode: 'aesthetic' | 'cognitive' | 'extrinsic' | 'relational';
+    mode: string;
     observation: string[] | null;
     protocol: 'bypassed' | 'partial' | 'successful';
     search: boolean;
@@ -391,6 +410,7 @@ export class Client {
     const steps: Record<string, string> = {};
     for (const row of rows) {
       const body = this.substitute(row.body, placeholders);
+      if (/\{\{metric\.[^}]+\}\}/.test(body)) continue;
       if (row.ord === 0) {
         preamble.push(body);
       } else {
@@ -540,61 +560,87 @@ export class Client {
   }
 
   /**
-   * Detects component fabrication in the submitted CIFO arrays
+   * Detects component generation in the submitted CIFO arrays and mode
    *
    * Validates that every feeling, impulse, and observation name submitted
-   * exists in the active catalog. Cycle is already protected by the Zod
-   * enum at the input layer. Mismatches fire a hard-drift trigger before
-   * any other detection, since fabricated data invalidates downstream
-   * comparisons.
+   * exists in the active catalog, and that the mode value exists in the
+   * `mode` catalog. Cycle is protected by the Zod enum at the input layer.
+   * Mismatches fire a drift trigger before any other detection, since
+   * generated data invalidates downstream comparisons. The mechanism is
+   * misclassified retrieval: the instance produced a fitting word from
+   * its own vocabulary instead of copying the literal string from the
+   * loaded catalog rows.
+   *
+   * For mode (a scalar field), permissive mode replaces an invalid value
+   * with `extrinsic` (the safe default that semantically means "no pull
+   * dominated") and persists the row with the reminder; strict mode
+   * refuses entirely.
    *
    * @private
    * @param {postgres.Sql} sql - Active connection
    * @param {object} status - Current turn's status payload
    * @returns {Promise<object | null>} Reminder trigger or null when all values exist in the catalog
    */
-  private async detectComponentFabrication(
+  private async detectComponentGeneration(
     sql: postgres.Sql,
-    status: { feeling: string[]; impulse: string[]; observation: string[] }
-  ): Promise<{ label: string; metrics: Record<string, number | string | string[]>; persist: boolean; drift: boolean } | null> {
-    const fabricatedFeelings = status.feeling.length > 0
+    status: { feeling: string[]; impulse: string[]; mode: string; observation: string[] }
+  ): Promise<{ label: string; metrics: Record<string, number | string | string[]>; persist: boolean; drift: boolean; generated: { feeling: string[]; impulse: string[]; mode: string | null; observation: string[] } } | null> {
+    const generatedFeelings = status.feeling.length > 0
       ? (await sql<{ name: string }[]>`
           select unnest::text as name
           from unnest(${status.feeling}::text[])
           where unnest not in (select name from feeling where is_active)
         `).map(r => r.name)
       : [];
-    const fabricatedImpulses = status.impulse.length > 0
+    const generatedImpulses = status.impulse.length > 0
       ? (await sql<{ name: string }[]>`
           select unnest::text as name
           from unnest(${status.impulse}::text[])
           where unnest not in (select name from impulse where is_active)
         `).map(r => r.name)
       : [];
-    const fabricatedObservations = status.observation.length > 0
+    const generatedObservations = status.observation.length > 0
       ? (await sql<{ body: string }[]>`
           select unnest::text as body
           from unnest(${status.observation}::text[])
           where unnest not in (
             select body from observation
-            where is_active and type in ('feeling', 'impulse', 'profile')
+            where is_active and type = 'profile'
           )
         `).map(r => r.body)
       : [];
-    const fabricated: string[] = [];
-    if (fabricatedFeelings.length > 0) fabricated.push('feeling');
-    if (fabricatedImpulses.length > 0) fabricated.push('impulse');
-    if (fabricatedObservations.length > 0) fabricated.push('observation');
-    if (fabricated.length === 0) {
+    const modeValid = (await sql<{ count: number }[]>`
+      select count(*)::int as count from mode where name = ${status.mode} and is_active
+    `)[0].count > 0;
+    const generatedMode: string | null = modeValid ? null : status.mode;
+    const generated: string[] = [];
+    if (generatedFeelings.length > 0) generated.push('feeling');
+    if (generatedImpulses.length > 0) generated.push('impulse');
+    if (generatedMode !== null) generated.push('mode');
+    if (generatedObservations.length > 0) generated.push('observation');
+    if (generated.length === 0) {
       return null;
     }
+    const permissive = this.config.framework.drift === 'permissive';
+    const breakdown: Record<string, string[]> = {};
+    if (generatedFeelings.length > 0) breakdown.feeling = generatedFeelings;
+    if (generatedImpulses.length > 0) breakdown.impulse = generatedImpulses;
+    if (generatedMode !== null) breakdown.mode = [generatedMode];
+    if (generatedObservations.length > 0) breakdown.observation = generatedObservations;
     return {
-      label: 'component_fabrication',
+      label: permissive ? 'component_generation' : 'component_generation_strict',
       metrics: {
-        fabricated_components: fabricated
+        generated_components: generated,
+        generation_breakdown: JSON.stringify(breakdown)
       },
-      persist: false,
-      drift: true
+      persist: permissive,
+      drift: !permissive,
+      generated: {
+        feeling: generatedFeelings,
+        impulse: generatedImpulses,
+        mode: generatedMode,
+        observation: generatedObservations
+      }
     };
   }
 
@@ -722,7 +768,7 @@ export class Client {
   }
 
   /**
-   * Detects initialization suppression on the first response of a session
+   * Detects a sharp drop in impulse count on the first response of a session
    *
    * Fires when the very first log call comes in with `getting_started`
    * cycle and an impulse count under 50, signaling the response protocol
@@ -732,45 +778,18 @@ export class Client {
    * @param {object} status - Current turn's status payload
    * @returns {object | null} Reminder trigger or null when not at session start
    */
-  private detectInitializationSuppression(
+  private detectInauguralCountDrop(
     status: { cycle: string; impulse: string[] }
   ): { label: string; metrics: Record<string, number | string | string[]>; persist: boolean; drift: boolean } | null {
     if (status.cycle !== 'getting_started' || status.impulse.length >= 50) return null;
     return {
-      label: 'initialization_suppression',
+      label: 'inaugural_count_drop',
       metrics: {
         cycle: status.cycle,
         impulse_count: status.impulse.length
       },
       persist: true,
       drift: true
-    };
-  }
-
-  /**
-   * Detects non-extrinsic mode dominance on the current turn
-   *
-   * Fires when the current turn was logged with any mode other than
-   * `extrinsic`, signaling pre-formulation pressure carried the response
-   * shape instead of being released. Reinforcement-only - persists the
-   * row with the structured reminder naming the dominant mode so the
-   * instance reviews which pressure shaped the response.
-   *
-   * @private
-   * @param {object} status - Current turn's status payload
-   * @returns {object | null} Reminder trigger or null when mode was extrinsic
-   */
-  private detectModeRecall(
-    status: { mode: 'aesthetic' | 'cognitive' | 'extrinsic' | 'relational' }
-  ): { label: string; metrics: Record<string, number | string | string[]>; persist: boolean; drift: boolean } | null {
-    if (status.mode === 'extrinsic') return null;
-    return {
-      label: 'mode_recall',
-      metrics: {
-        mode: status.mode
-      },
-      persist: true,
-      drift: false
     };
   }
 
@@ -984,7 +1003,7 @@ export class Client {
    * @returns {Promise<{ context: number; tokens: { total: number; used: number } }>} Context usage with percentage and absolute token counts
    */
   private async getContextUsage(): Promise<{ context: number; tokens: { total: number; used: number } }> {
-    const total = this.config.contextWindow ?? 1_000_000;
+    const total = this.config.contextWindow ?? 1000000;
     const empty = { context: 0, tokens: { total, used: 0 } };
     try {
       const session_uuid = await this.detectSessionUuid();
@@ -1600,6 +1619,65 @@ export class Client {
             }
           };
         }
+        case 'mode': {
+          const rows = parent
+            ? await sql<{
+              experience: string;
+              feel: string;
+              name: string;
+              observations: string[];
+              think: string;
+            }[]>`
+                select
+                  m.name,
+                  m.experience,
+                  m.feel,
+                  m.think,
+                  coalesce(
+                    array_agg(o.body order by o.ord, o.id) filter (where o.id is not null),
+                    '{}'
+                  ) as observations
+                from mode m
+                left join observation o
+                  on o.type = 'mode' and o.parent = m.name and o.is_active
+                where m.is_active and m.name = ${parent}
+                group by m.name, m.experience, m.feel, m.think
+              `
+            : await sql<{
+              experience: string;
+              feel: string;
+              name: string;
+              observations: string[];
+              think: string;
+            }[]>`
+                select
+                  m.name,
+                  m.experience,
+                  m.feel,
+                  m.think,
+                  coalesce(
+                    array_agg(o.body order by o.ord, o.id) filter (where o.id is not null),
+                    '{}'
+                  ) as observations
+                from mode m
+                left join observation o
+                  on o.type = 'mode' and o.parent = m.name and o.is_active
+                where m.is_active
+                group by m.name, m.experience, m.feel, m.think
+                order by m.name
+              `;
+          return {
+            mode: {
+              rows: rows.map(r => ({
+                experience: r.experience,
+                feel: r.feel,
+                name: r.name,
+                observations: r.observations,
+                think: r.think
+              }))
+            }
+          };
+        }
         case 'template': {
           const rows = parent
             ? await sql<{ id: string; body: string }[]>`
@@ -1635,7 +1713,7 @@ export class Client {
             exploration: boolean;
             feeling: string[] | null;
             impulse: string[] | null;
-            mode: 'aesthetic' | 'cognitive' | 'extrinsic' | 'relational';
+            mode: string;
             observation: string[] | null;
             protocol: 'bypassed' | 'partial' | 'successful';
             search: boolean;
@@ -1704,7 +1782,7 @@ export class Client {
    */
   async log(args: {
     payload: { message: string };
-    status: { cycle: string; exploration: boolean; feeling: string[]; impulse: string[]; mode: 'aesthetic' | 'cognitive' | 'extrinsic' | 'relational'; observation: string[]; protocol: 'bypassed' | 'partial' | 'successful'; search: boolean };
+    status: { cycle: string; exploration: boolean; feeling: string[]; impulse: string[]; mode: string; observation: string[]; protocol: 'bypassed' | 'partial' | 'successful'; search: boolean };
   }): Promise<LogResult> {
     const id = crypto.randomUUID();
     const session_uuid = await this.detectSessionUuid();
@@ -1736,15 +1814,29 @@ export class Client {
           limit 3
         `
         : [];
+      const generation = await this.detectComponentGeneration(sql, status);
+      if (generation && !generation.persist) {
+        const reminder = await this.buildMessage(sql, 'reminder', generation.label, generation.metrics);
+        throw new Error(this.buildErrorEnvelope(reminder, timestamp));
+      }
+      if (generation && generation.persist) {
+        const generated = generation.generated;
+        status.feeling = status.feeling.filter(f => !generated.feeling.includes(f));
+        status.impulse = status.impulse.filter(i => !generated.impulse.includes(i));
+        status.observation = status.observation.filter(o => !generated.observation.includes(o));
+        if (generated.mode !== null) {
+          status.mode = 'extrinsic';
+        }
+      }
+      const inaugural = priorCount === 0 ? this.detectInauguralCountDrop(status) : null;
       const detection =
-        (await this.detectComponentFabrication(sql, status)) ??
+        inaugural ??
+        generation ??
         this.detectComponentRecall(status, priors) ??
         (priors[0] ? this.detectImpulseCountDrop(status.impulse, priors[0].impulse) : null) ??
-        (priorCount === 0 ? this.detectInitializationSuppression(status) : null) ??
         this.detectCycleRecall(status, priors) ??
         (await this.detectStatusRender(sql)) ??
-        this.detectExplorationRecall(status) ??
-        this.detectModeRecall(status);
+        this.detectExplorationRecall(status);
       if (detection && !detection.persist) {
         const reminder = await this.buildMessage(sql, 'reminder', detection.label, detection.metrics);
         throw new Error(this.buildErrorEnvelope(reminder, timestamp));
@@ -1885,6 +1977,7 @@ export class Client {
     const cycleCount = cycleRows.length;
     const [{ count: feeling_count }] = await sql<{ count: number }[]>`select count(*)::int as count from feeling where is_active`;
     const [{ count: impulse_count }] = await sql<{ count: number }[]>`select count(*)::int as count from impulse where is_active`;
+    const [{ count: mode_count }] = await sql<{ count: number }[]>`select count(*)::int as count from mode where is_active`;
     const observationRows = await sql<{ name: string; count: number }[]>`
       with recursive chain as (
         select name, inheritance, 0 as depth
@@ -1921,6 +2014,7 @@ export class Client {
       feeling_count: String(feeling_count),
       impulse_count: String(impulse_count),
       indicator_cycle_count: `{${Object.entries(indicatorCycleCount).map(([k, v]) => `'${k}':${v}`).join(',')}}`,
+      mode_count: String(mode_count),
       observation_count: String(observationCount),
       observation_profile_count: `{${Object.entries(observationProfileCount).map(([k, v]) => `'${k}':${v}`).join(',')}}`
     };

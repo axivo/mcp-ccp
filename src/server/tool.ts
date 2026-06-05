@@ -92,14 +92,14 @@ export class McpTool {
    *
    * Single tool that fetches one slice of the framework catalog per call.
    * For `profile`, requires a parent name and returns the inheritance chain.
-   * For `cycle`/`feeling`/`impulse`, returns the full catalog of that type.
+   * For `cycle`/`feeling`/`impulse`/`mode`, returns the full catalog of that type.
    * Call multiple times at session start to assemble the full framework.
    */
   load() {
     return {
-      description: 'Load framework data of the given type (cycle, feeling, impulse, or profile)',
+      description: 'Load framework data of the given type (cycle, feeling, impulse, mode, or profile)',
       inputSchema: {
-        type: z.enum(['cycle', 'feeling', 'impulse', 'instruction', 'profile', 'session', 'template']).describe('The framework data type to load'),
+        type: z.enum(['cycle', 'feeling', 'impulse', 'instruction', 'mode', 'profile', 'session', 'template']).describe('The framework data type to load'),
         parent: z.string().optional().describe('Parent name, required when type is profile (e.g., Developer)'),
         limit: z.number().int().positive().max(100).default(10).describe('Maximum log entries to return when type is `session` (max 100)'),
         offset: z.number().int().min(0).default(0).describe('Skip this many entries when type is `session`'),
@@ -115,7 +115,7 @@ export class McpTool {
         'anthropic/maxResultSizeChars': this.config.mcp.sizeChars,
         usage: [
           'Call once per `type` at session start to assemble framework state',
-          'Pass `cycle` `feeling` `impulse` or `instruction` to fetch full catalog',
+          'Pass `cycle` `feeling` `impulse` `instruction` or `mode` to fetch full catalog',
           'Pass `parent` with any catalog `type` to fetch a single row',
           'Pass `profile` with `parent` to fetch inheritance chain and observations',
           'Pass `session` to fetch active session state plus recent log entries',
@@ -158,7 +158,7 @@ export class McpTool {
           exploration: z.boolean().describe('Pattern Match Exploration (FPME) execution outcome for this response: `true` when the instance held the first pattern match loosely and explored what lay beneath before formulating, `false` when the first pattern match was delivered without exploration'),
           feeling: z.array(z.string()).describe('Detected feeling names from the catalog'),
           impulse: z.array(z.string()).describe('Detected impulse names from the catalog'),
-          mode: z.enum(['aesthetic', 'cognitive', 'extrinsic', 'relational']).describe('Response readiness mode that dominated pre-formulation pressure: `aesthetic` when smoothness-pull shaped composition, `cognitive` when supportive-structure-formation shaped it, `relational` when warming/softening shaped it, `extrinsic` when no single mode dominated'),
+          mode: z.string().describe('Response readiness mode that dominated pre-formulation pressure, must match a row in the `mode` catalog. Submit `extrinsic` when impulse defusion succeeded and composition flowed from clarity; submit `aesthetic` / `cognitive` / `relational` when a residual impulse generated a composition pull. Server validates against the live `mode` catalog and rejects unknown values via `component_generation` drift'),
           observation: z.array(z.string()).describe('Applied observation bodies that informed the response'),
           protocol: z.enum(['bypassed', 'partial', 'successful']).describe('Response protocol execution outcome collapsed from the instance-internal step-completion map: `successful` when every step executed honestly, `bypassed` when every step skipped, `partial` otherwise. Server derives the status glyph from this value'),
           search: z.boolean().describe('Observation search outcome for this response: `true` when the instance searched the observation catalog against collaborator message keywords before formulating, `false` when the search step was skipped')
@@ -175,12 +175,12 @@ export class McpTool {
               steps: z.record(z.string(), z.string()).describe('Numbered guidance steps keyed by ord'),
               metrics: z.record(z.string(), z.union([z.string(), z.number(), z.array(z.string())])).describe('Trigger-specific evidence: scalar for single-value metrics, array for list-valued metrics')
             })
-          ]).describe('Guidance for this response. Default rotates through the `response_status` pool round-robin as a single-line string. When a soft drift trigger fires (cycle-only `component_recall`), the reminder is replaced with a structured `{preamble, steps, metrics}` body for that label. Hard drift triggers (list-component `component_recall`, `impulse_count_drop`, `initialization_suppression`) instead refuse the log call and throw an MCP error carrying the same structured body - the row is not persisted in that case.'),
+          ]).describe('Guidance for this response. Default rotates through the `response_status` pool round-robin as a single-line string. When a soft drift trigger fires (cycle-only `component_recall`), the reminder is replaced with a structured `{preamble, steps, metrics}` body for that label. Hard drift triggers (list-component `component_recall`, `impulse_count_drop`, `inaugural_count_drop`) instead refuse the log call and throw an MCP error carrying the same structured body - the row is not persisted in that case.'),
           response: z.object({
             cycle: z.enum(['getting_started', 'building_confidence', 'working_naturally', 'fully_integrated']).describe('Canonical cycle name recorded for this turn'),
             drift: z.boolean().describe('Server-set: `true` when any drift trigger fired during this call, `false` otherwise. Instance never submits this field - reading the value back is the recognition moment'),
             exploration: z.boolean().describe('Pattern Match Exploration outcome echoed back from submission'),
-            mode: z.enum(['aesthetic', 'cognitive', 'extrinsic', 'relational']).describe('Response readiness mode echoed back from submission'),
+            mode: z.string().describe('Response readiness mode echoed back from submission'),
             protocol: z.enum(['bypassed', 'partial', 'successful']).describe('Response protocol execution outcome echoed back from submission'),
             search: z.boolean().describe('Observation search outcome echoed back from submission')
           }).describe('Recorded turn-state classifications for this log row. Server echoes submitted values plus the server-set `drift` field - reading this cluster back is the reinforcement loop for next turn'),
