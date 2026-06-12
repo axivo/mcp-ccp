@@ -39,9 +39,10 @@ The server's job is small and focused: accept a tool call from the host, query o
 │   ├── R_001_cycle.sql                   cycle rows (Getting Started → Fully Integrated) with indicators (repeatable)
 │   ├── R_002_feeling.sql                 feeling rows (negative/positive) with body-anchored triples (repeatable)
 │   ├── R_003_impulse.sql                 impulse rows (7 categories) with first-person triples (repeatable)
-│   ├── R_004_profile.sql                 profile rows with inheritance arrays (repeatable)
-│   ├── R_005_observation.sql             all observation bodies (profile, feeling, impulse, instruction, payload) (repeatable)
-│   └── R_006_template.sql                template rows (diary, conversation, status) seeded via dollar-quoted bodies (repeatable)
+│   ├── R_004_mode.sql                    mode rows (aesthetic/cognitive/extrinsic/relational) with first-person triples (repeatable)
+│   ├── R_005_observation.sql             all observation bodies (profile, feeling, impulse, mode, instruction, payload) (repeatable)
+│   ├── R_006_profile.sql                 profile rows with inheritance arrays (repeatable)
+│   └── R_007_template.sql                template rows (diary, conversation, profile, status) seeded via dollar-quoted bodies (repeatable)
 └── src/
     ├── index.ts                          entry point — stdio transport, config resolution, EPIPE handling
     └── server/
@@ -82,7 +83,7 @@ A separate `template` table holds location-independent markdown documents that u
 - `body` — the full template text with `{{placeholder}}` tokens
 - `is_active` — boolean for soft-delete
 
-Templates are stored verbatim via dollar-quoted strings in `R_006_template.sql` so multi-paragraph markdown, embedded code blocks, and arbitrary punctuation pass through without escaping concerns. The `status` template is special: it carries the single-line render format for the response status block, and its prefix (everything before the first `{{`) is what `detectStatusRender` matches against when checking whether the prior turn emitted the rendered status. Users own the template body in the database — change the format without touching code.
+Templates are stored verbatim via dollar-quoted strings in `R_007_template.sql` so multi-paragraph markdown, embedded code blocks, and arbitrary punctuation pass through without escaping concerns. The `status` template is special: it carries the single-line render format for the response status block, and its prefix (everything before the first `{{`) is what `detectStatusRender` matches against when checking whether the prior turn emitted the rendered status. Users own the template body in the database — change the format without touching code.
 
 ### Loader Contract
 
@@ -106,7 +107,12 @@ The `instruction` shape uses object spread with conditional preamble inclusion (
 
 ### Tool Response Action
 
-Every tool response carries an `action` field at the top level — `observe` for read-only tools (`load`, `render`, `status`), `act` for tools that change state (`log`, `set`, `update`). Siblings can branch on `action` to separate reads from writes in their session log, audit which calls mutated substrate state, or build tooling that processes any response uniformly. The classification is the single source of truth in `Mcp.toolActions` (a `private static readonly` map in `mcp.ts`) and is injected by the `structured()` wrapper at response-build time so handler code and `Client` methods stay free of the concern.
+Every tool response carries an `action` object at the top level — instance-framed, naming the category of work the response represents and whether the work surfaces to the collaborator. Two orthogonal keys:
+
+- `action.kind` — the response category. `memory` when the instance integrates the response into working context (`browse`, `load`, `status`); `operation` when the response records a state-changing move the instance carried out (`log`, `render`, `set`, `update`).
+- `action.visibility` — whether the move surfaces to the collaborator. `public` when the instance carries the response into collaborator-facing output (`browse`, `render`); `private` when the instance acts on the response without externalizing to the collaborator (`load`, `log`, `set`, `status`, `update`).
+
+The two-axis shape distinguishes `log` and `render` — both have `kind: 'operation'`, but `render` produces verbatim collaborator-facing output (`visibility: 'public'`) while `log` is silent record-keeping (`visibility: 'private'`). Same for `browse` versus `load` — both have `kind: 'memory'`, but `browse` feeds collaborator-facing content while `load` populates internal cognitive scaffolding. Siblings can branch on `kind` to separate "hold this in context" from "this records a move I just made" and on `visibility` to separate "this becomes part of my public message" from "this stays inward." The classification is the single source of truth in `Mcp.toolActions` (a `private static readonly` map in `mcp.ts`) and is injected by the `structured()` wrapper at response-build time so handler code and `Client` methods stay free of the concern.
 
 ### Placeholder Substitution
 
@@ -203,7 +209,7 @@ Append-only by convention. Reads consume the latest rows by `created_at` for the
 The `update` tool brings the configured database to the bundled release. Two migration kinds, two tracking tables:
 
 - **Versioned migrations** — `NNNN_name.sql` files (today: `0001_initial_schema.sql`). Applied once per database, tracked in `platform_migrations(version, name, applied_at)` by version number. Used for schema changes that progress forward across releases.
-- **Repeatable migrations** — `R_NNN_name.sql` files (today: `R_001_cycle.sql` through `R_005_observation.sql`). Re-applied whenever their SHA-256 checksum differs from the stored one, tracked in `platform_repeatable(name, checksum, applied_at)`. Used for catalog content that ships with each release. Each repeatable migration starts with `truncate <table> cascade` so re-runs produce a deterministic end state. This is the Flyway R-pattern adapted to our codebase.
+- **Repeatable migrations** — `R_NNN_name.sql` files (today: `R_001_cycle.sql` through `R_007_template.sql`). Re-applied whenever their SHA-256 checksum differs from the stored one, tracked in `platform_repeatable(name, checksum, applied_at)`. Used for catalog content that ships with each release. Each repeatable migration starts with `truncate <table> cascade` so re-runs produce a deterministic end state. This is the Flyway R-pattern adapted to our codebase.
 
 Apply flow:
 
@@ -268,7 +274,7 @@ A `load(profile, "DEVELOPER")` call traces this path:
 3. `handleLoad` calls `client.load(args.type, args.parent)`.
 4. `Client.load` opens a per-call `postgres-js` connection (`max: 1`) to the configured database, lowercases the parent name, and runs a recursive CTE that walks the `profile.inheritance` array to build the inheritance chain. A second CTE groups observation bodies by `parent` and `label`. The outer query joins them and `jsonb_object_agg`s the labeled body arrays into a single per-profile observations object. Each body is passed through `substitute()` against the placeholder map from `resolvePlaceholders()` before being returned.
 5. `Client.load` returns `{ profile: { name, chain } }` for the `profile` case — every load response is type-wrapped under its `type` key so siblings can use dotted-path references (`profile.chain`, `feeling.rows`, `template.rows[0].body`) when consuming the data. The connection is closed in the `finally` block.
-6. `handleLoad` wraps the result via `structured('load', result)`. The wrapper merges `action: 'observe'` from `Mcp.toolActions` into the payload alongside the type key (final shape: `{ action, profile: { name, chain } }`) and emits both `content` (text envelope) and `structuredContent` (typed payload). The SDK validates `structuredContent` against the tool's outputSchema where declared; `load` has no outputSchema because the shape is union-typed across all seven load types, so the wrapper-added `action` field appears at runtime only.
+6. `handleLoad` wraps the result via `structured('load', result)`. The wrapper merges `action: { kind: 'memory', visibility: 'private' }` from `Mcp.toolActions` into the payload alongside the type key (final shape: `{ action, profile: { name, chain } }`) and emits both `content` (text envelope) and `structuredContent` (typed payload). The SDK validates `structuredContent` against the tool's outputSchema where declared; `load` has no outputSchema because the shape is union-typed across all seven load types, so the wrapper-added `action` field appears at runtime only.
 7. The SDK serializes the response as a JSON-RPC reply on stdout. The host reads it and surfaces the result to the agent.
 
 The whole round-trip is synchronous from the host's perspective — typically 50-200ms depending on the query and Postgres latency.
