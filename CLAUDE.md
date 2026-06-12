@@ -192,17 +192,17 @@ The default is permissive because the framework's care philosophy ("protocol is 
 The `log` tool persists a row per response to the `session_log` table. The shape:
 
 - `id` — server-generated RFC4122 v4 UUID, reused when rendering the response status line so the persisted row and the visible UUID match
-- `session_uuid` — Claude Code session UUID detected from transcript filename, server-side
+- `session_id` — Claude Code session UUID detected from transcript filename, server-side (FK to `session.id`, ON DELETE CASCADE)
 - `message` — first-person prose composed by the sibling for this turn
 - `cycle`, `feeling`, `impulse`, `observation` — individual columns holding the turn's CIFO record; `cycle` stores the canonical name (e.g., `getting_started`), not the display label
 - `drift` — boolean, server-set from the detection result. `true` when a soft drift trigger fired, `false` otherwise (including no-drift turns). Stored alongside the row for downstream analysis.
 - `exploration` — boolean, sibling-submitted. `true` when the first pattern match was held loosely and explored before formulating, `false` when the first match was delivered without exploration.
-- `mode` — `response_mode` enum column with values `aesthetic | cognitive | extrinsic | relational`. The dominant readiness mode that shaped pre-formulation pressure.
+- `mode` — `text` column with FK to `mode (name)` on update cascade. Catalog rows in the `mode` table define the valid values (`aesthetic`, `cognitive`, `extrinsic`, `relational`). The dominant readiness mode that shaped pre-formulation pressure.
 - `protocol` — `response_protocol` enum column with values `bypassed | partial | successful`; server derives the status glyph from this value (`successful` → 🟢, `partial` → 🟡, `bypassed` → 🔴)
 - `search` — boolean, sibling-submitted. `true` when the observation catalog was searched against collaborator message keywords before formulating, `false` when search was skipped.
 - `created_at` — `timestamptz default now()`
 
-Append-only by convention. Reads consume the latest rows by `created_at` for the active `session_uuid` — the trigger evaluation in `log` fetches up to 3 prior rows to compare current vs prior turns before insert (set-equality per list-component against the immediate prior, cycle-transition check against the last three).
+Append-only by convention. Reads consume the latest rows by `created_at` for the active `session_id` — the trigger evaluation in `log` fetches up to 3 prior rows to compare current vs prior turns before insert (set-equality per list-component against the immediate prior, cycle-transition check against the last three).
 
 ### Migration Runner
 
@@ -255,7 +255,7 @@ Seven tools live in `McpTool`, each registered once in `Mcp.registerAll()`:
 
 `render` produces a formatted string for response-zero formatting needs. Today only `render('profile')` exists, returning the profile-and-timestamp top line.
 
-`set` is the canonical mutation entry point. `set('session')` upserts the `session` row on the active session_uuid, returning the post-write state. Pair with `load('session')` for reads — `set` returns the same `session` shape minus `payload.log` so siblings refreshing memory should call `load` to avoid touching `updated_at`.
+`set` is the canonical mutation entry point. `set('session')` upserts the `session` row on the active session id, returning the post-write state. Pair with `load('session')` for reads — `set` returns the same `session` shape minus `payload.log` so siblings refreshing memory should call `load` to avoid touching `updated_at`.
 
 `status` returns the database snapshot (schema version, catalog statistics with per-profile observation counts scoped to the active inheritance chain) plus the full tool surface with usage directives. Also fetches the Anthropic platform status from `status.claude.com` and returns it as `upstream` — mirrors the Statuspage summary shape with `page` and `status` always present, `incidents` and `scheduled_maintenances` conditional on being populated, each carrying URLs the sibling can follow via `browse`. Fetched in parallel with the local DB queries (`Promise.all`), fail-soft to `null` on timeout or fetch failure so session-start never blocks on upstream availability. `page.updated_at` is converted to the active session timezone via `Time.toLocal`. Call at session start to learn what's available.
 
