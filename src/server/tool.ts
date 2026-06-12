@@ -145,7 +145,7 @@ export class McpTool {
    *
    * Called once per response at step 27 of the response protocol. Instance
    * supplies message prose and the structured status payload. Server generates
-   * the row id, pulls `session_uuid` from the cached transcript detection,
+   * the row id, pulls `session_id` from the cached transcript detection,
    * writes the row, and returns the rendered two-line block ready to display.
    * Append-only, every call creates a new row.
    */

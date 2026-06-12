@@ -167,7 +167,7 @@ create table template (
 -- -----------------------------------------------------------------------------
 
 create table session (
-  session_uuid  text primary key,
+  id            uuid primary key,
   title         text,
   description   text,
   created_at    timestamptz not null default now(),
@@ -180,7 +180,7 @@ create table session (
 
 create table session_log (
   id            uuid primary key,
-  session_uuid  text not null,
+  session_id    uuid not null references session (id) on delete cascade,
   message       text not null default '',
   cycle         text,
   feeling       text[],
@@ -194,7 +194,7 @@ create table session_log (
   created_at    timestamptz not null default now()
 );
 
-create index idx_session_log_session_uuid on session_log (session_uuid, created_at);
+create index idx_session_log_session on session_log (session_id, created_at);
 
 -- -----------------------------------------------------------------------------
 -- project - long-lived container for tasks and team work
@@ -239,13 +239,13 @@ create index idx_task_status on task (status) where status != 'completed';
 -- -----------------------------------------------------------------------------
 
 create table concourse (
-  task_id       uuid not null references task(id) on delete cascade,
-  session_uuid  text not null,
+  task_id       uuid not null references task (id) on delete cascade,
+  session_id    uuid not null references session (id) on delete cascade,
   created_at    timestamptz not null default now(),
-  primary key (task_id, session_uuid)
+  primary key (task_id, session_id)
 );
 
-create index idx_concourse_session on concourse (session_uuid);
+create index idx_concourse_session on concourse (session_id);
 
 -- -----------------------------------------------------------------------------
 -- issue - external tracker reference scoped to a task

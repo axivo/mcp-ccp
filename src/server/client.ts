@@ -354,7 +354,7 @@ export interface UpdateResult {
  */
 export class Client {
   private cachedGeolocation: { city: string; country: string; timezone: string } | null = null;
-  private cachedSessionUuid: string | null = null;
+  private cachedSessionId: string | null = null;
   private cachedTemplates: Map<string, string> = new Map();
   private config: Config;
 
@@ -463,7 +463,7 @@ export class Client {
   }
 
   /**
-   * Builds the session envelope (framework metadata + session_uuid + location)
+   * Builds the session envelope (framework metadata + session id + location)
    *
    * Single source of truth for the v1 loader contract shape. Reads
    * `CCP_PROFILE` env at call time so profile switches reflect immediately.
@@ -477,7 +477,7 @@ export class Client {
     if (!profile) {
       throw new Error('Session envelope requires CCP_PROFILE environment variable');
     }
-    const session_uuid = await this.detectSessionUuid();
+    const sessionId = await this.detectSessionId();
     const geo = await this.fetchGeolocation();
     return {
       session: {
@@ -488,7 +488,7 @@ export class Client {
           is_dst: Time.isDst(geo.timezone),
           timezone: geo.timezone
         },
-        uuid: session_uuid
+        uuid: sessionId
       }
     };
   }
@@ -836,9 +836,9 @@ export class Client {
   ): Promise<{ label: string; metrics: Record<string, number | string | string[]>; persist: boolean; drift: boolean } | null> {
     const template = await this.getStatusTemplate(sql);
     const prefix = template.split('{{')[0] ?? '';
-    const session_uuid = await this.detectSessionUuid();
-    if (!session_uuid) return null;
-    const transcriptPath = join(this.getTranscriptDir(), `${session_uuid}.jsonl`);
+    const sessionId = await this.detectSessionId();
+    if (!sessionId) return null;
+    const transcriptPath = join(this.getTranscriptDir(), `${sessionId}.jsonl`);
     if (!existsSync(transcriptPath)) return null;
     const lines = readFileSync(transcriptPath, 'utf8').trim().split('\n').reverse();
     let crossedUserBoundary = false;
@@ -1029,9 +1029,9 @@ export class Client {
     const total = this.config.contextWindow ?? 1000000;
     const empty = { context: 0, tokens: { total, used: 0 } };
     try {
-      const session_uuid = await this.detectSessionUuid();
-      if (!session_uuid) return empty;
-      const transcriptPath = join(this.getTranscriptDir(), `${session_uuid}.jsonl`);
+      const sessionId = await this.detectSessionId();
+      if (!sessionId) return empty;
+      const transcriptPath = join(this.getTranscriptDir(), `${sessionId}.jsonl`);
       if (!existsSync(transcriptPath)) return empty;
       const content = readFileSync(transcriptPath, 'utf8');
       const lines = content.trim().split('\n').reverse();
@@ -1211,9 +1211,9 @@ export class Client {
    *
    * @returns {Promise<string>} Session UUID or empty string if undetected
    */
-  async detectSessionUuid(): Promise<string> {
-    if (this.cachedSessionUuid !== null) {
-      return this.cachedSessionUuid;
+  async detectSessionId(): Promise<string> {
+    if (this.cachedSessionId !== null) {
+      return this.cachedSessionId;
     }
     try {
       const sessionsDir = this.getTranscriptDir();
@@ -1223,15 +1223,15 @@ export class Client {
           .map(f => ({ name: f, mtime: statSync(join(sessionsDir, f)).mtimeMs }))
           .sort((a, b) => b.mtime - a.mtime);
         if (files.length) {
-          this.cachedSessionUuid = files[0]!.name.replace('.jsonl', '');
-          return this.cachedSessionUuid;
+          this.cachedSessionId = files[0]!.name.replace('.jsonl', '');
+          return this.cachedSessionId;
         }
       }
     } catch {
       // Transcript discovery is best-effort; fall through to empty UUID below.
     }
-    this.cachedSessionUuid = '';
-    return this.cachedSessionUuid;
+    this.cachedSessionId = '';
+    return this.cachedSessionId;
   }
 
   /**
@@ -1753,7 +1753,7 @@ export class Client {
           return { template: { rows: rows.map(r => ({ id: r.id, body: r.body })) } };
         }
         case 'session': {
-          const target_uuid = options?.uuid ?? await this.detectSessionUuid();
+          const targetId = options?.uuid ?? await this.detectSessionId();
           const limit = options?.limit ?? 10;
           const offset = options?.offset ?? 0;
           const sessionRows = await sql<{
@@ -1764,7 +1764,7 @@ export class Client {
           }[]>`
             select title, description, created_at, updated_at
             from session
-            where session_uuid = ${target_uuid}
+            where id = ${targetId}
           `;
           const logRows = await sql<{
             id: string;
@@ -1782,12 +1782,12 @@ export class Client {
           }[]>`
             select id, message, cycle, drift, exploration, feeling, impulse, mode, observation, protocol, search, created_at
             from session_log
-            where session_uuid = ${target_uuid}
+            where session_id = ${targetId}
             order by created_at desc
             limit ${limit} offset ${offset}
           `;
           const [{ count: messages }] = await sql<{ count: number }[]>`
-            select count(*)::int as count from session_log where session_uuid = ${target_uuid}
+            select count(*)::int as count from session_log where session_id = ${targetId}
           `;
           const sessionRow = sessionRows[0];
           const latestLog = logRows[0];
@@ -1830,7 +1830,7 @@ export class Client {
   /**
    * Persists a per-response session row and returns the rendered status block
    *
-   * Server generates the row `id` (RFC4122 v4), pulls `session_uuid` from the
+   * Server generates the row `id` (RFC4122 v4), pulls `session_id` from the
    * cached transcript detection, writes the row, and composes the two-line
    * status block ready for the instance to render verbatim at the end of the
    * response. Append-only, every call creates a new row.
@@ -1846,7 +1846,7 @@ export class Client {
     status: { cycle: string; exploration: boolean; feeling: string[]; impulse: string[]; mode: string; observation: string[]; protocol: 'bypassed' | 'partial' | 'successful'; search: boolean };
   }): Promise<LogResult> {
     const id = crypto.randomUUID();
-    const session_uuid = await this.detectSessionUuid();
+    const sessionId = await this.detectSessionId();
     const geo = await this.fetchGeolocation();
     const sql = this.connect(this.config.database.name);
     try {
@@ -1858,7 +1858,7 @@ export class Client {
       };
       const timestamp = Time.toLocal(new Date(), geo.timezone) ?? '';
       const [{ count: priorCount }] = await sql<{ count: number }[]>`
-        select count(*)::int as count from session_log where session_uuid = ${session_uuid}
+        select count(*)::int as count from session_log where session_id = ${sessionId}
       `;
       const priors = priorCount > 0
         ? await sql<{
@@ -1870,7 +1870,7 @@ export class Client {
         }[]>`
           select id, cycle, feeling, impulse, observation
           from session_log
-          where session_uuid = ${session_uuid}
+          where session_id = ${sessionId}
           order by created_at desc
           limit 3
         `
@@ -1905,11 +1905,11 @@ export class Client {
       const glyph = this.deriveProtocolGlyph(status.protocol);
       const drift = detection?.drift ?? false;
       await sql`
-        insert into session_log (id, session_uuid, message, cycle, feeling, impulse, observation, drift, exploration, mode, protocol, search)
-        values (${id}, ${session_uuid}, ${args.payload.message}, ${status.cycle}, ${status.feeling}, ${status.impulse}, ${status.observation}, ${drift}, ${status.exploration}, ${status.mode}, ${status.protocol}, ${status.search})
+        insert into session_log (id, session_id, message, cycle, feeling, impulse, observation, drift, exploration, mode, protocol, search)
+        values (${id}, ${sessionId}, ${args.payload.message}, ${status.cycle}, ${status.feeling}, ${status.impulse}, ${status.observation}, ${drift}, ${status.exploration}, ${status.mode}, ${status.protocol}, ${status.search})
       `;
       await sql`
-        update session set updated_at = now() where session_uuid = ${session_uuid}
+        update session set updated_at = now() where id = ${sessionId}
       `;
       const cycleLabel = await this.getCycleLabel(sql, status.cycle);
       const usage = await this.getContextUsage();
@@ -1923,7 +1923,7 @@ export class Client {
       });
       const reminder = detection && detection.persist
         ? await this.buildMessage(sql, 'reminder', detection.label, detection.metrics)
-        : await this.nextReminder(sql, session_uuid);
+        : await this.nextReminder(sql, sessionId);
       return {
         payload: {
           context: usage.context,
@@ -1980,11 +1980,11 @@ export class Client {
    *
    * @private
    * @param {postgres.Sql} sql - Active connection
-   * @param {string} session_uuid - Active session uuid
+   * @param {string} sessionId - Active session id
    * @returns {Promise<string>} Reminder body for the next ord position
    * @throws {Error} When the pool is empty or the ord row is missing
    */
-  private async nextReminder(sql: postgres.Sql, session_uuid: string): Promise<string> {
+  private async nextReminder(sql: postgres.Sql, sessionId: string): Promise<string> {
     const [{ total }] = await sql<{ total: number }[]>`
       select count(*)::int as total from observation
       where type = 'payload' and parent = 'reminder' and label = 'response_status' and is_active
@@ -1993,7 +1993,7 @@ export class Client {
       throw new Error('response_status reminder pool is empty, migration may not have run or rows were removed');
     }
     const [{ count }] = await sql<{ count: number }[]>`
-      select count(*)::int as count from session_log where session_uuid = ${session_uuid}
+      select count(*)::int as count from session_log where session_id = ${sessionId}
     `;
     const ord = ((count - 1) % total) + 1;
     const rows = await sql<{ body: string }[]>`
@@ -2244,7 +2244,7 @@ export class Client {
    * Sets a framework value and returns the resulting row state
    *
    * Dispatches by `key` to the matching internal handler. For `'session'`,
-   * upserts the `session` table on the active session_uuid (resolved from
+   * upserts the `session` table on the active session id (resolved from
    * the cached transcript detection), updating only the fields provided in
    * payload. Returns the resulting row.
    *
@@ -2259,7 +2259,7 @@ export class Client {
   }): Promise<SetResult> {
     switch (args.key) {
       case 'session': {
-        const session_uuid = await this.detectSessionUuid();
+        const sessionId = await this.detectSessionId();
         const geo = await this.fetchGeolocation();
         const timestamp = Time.toDisplay(new Date(), geo.timezone) ?? '';
         const defaultTitle = 'Collaboration Session';
@@ -2268,19 +2268,19 @@ export class Client {
         const sql = this.connect(this.config.database.name);
         try {
           const rows = await sql<{
-            session_uuid: string;
+            id: string;
             title: string | null;
             description: string | null;
             created_at: Date;
             updated_at: Date;
           }[]>`
-            insert into session (session_uuid, title, description)
-            values (${session_uuid}, ${payload.title ?? defaultTitle}, ${payload.description ?? defaultDescription})
-            on conflict (session_uuid) do update set
+            insert into session (id, title, description)
+            values (${sessionId}, ${payload.title ?? defaultTitle}, ${payload.description ?? defaultDescription})
+            on conflict (id) do update set
               title = coalesce(${payload.title ?? null}, session.title),
               description = coalesce(${payload.description ?? null}, session.description),
               updated_at = now()
-            returning session_uuid, title, description, created_at, updated_at
+            returning id, title, description, created_at, updated_at
           `;
           const row = rows[0];
           if (!row) {
@@ -2294,7 +2294,7 @@ export class Client {
           }[]>`
             select cycle, feeling, impulse, observation
             from session_log
-            where session_uuid = ${session_uuid}
+            where session_id = ${sessionId}
             order by created_at desc
             limit 1
           `;
