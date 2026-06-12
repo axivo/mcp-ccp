@@ -111,9 +111,10 @@ export class Time {
     const get = (type: string): string => parts.find(p => p.type === type)?.value ?? '';
     const tz = get('timeZoneName');
     const offset = tz.startsWith('GMT') ? tz.slice(3) || '+00:00' : '+00:00';
+    const shortMatch = offset.match(/^([+-])(\d{1,2})$/);
     const normalizedOffset = /^[+-]\d{2}:\d{2}$/.test(offset)
       ? offset
-      : (offset.match(/^([+-])(\d{1,2})$/) ? `${RegExp.$1}${RegExp.$2.padStart(2, '0')}:00` : '+00:00');
+      : shortMatch ? `${shortMatch[1]}${shortMatch[2].padStart(2, '0')}:00` : '+00:00';
     return `${get('year')}-${get('month')}-${get('day')}T${get('hour')}:${get('minute')}:${get('second')}${normalizedOffset}`;
   }
 }

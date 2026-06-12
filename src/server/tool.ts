@@ -54,7 +54,10 @@ export class McpTool {
         timeout: z.number().int().positive().optional().describe('Request timeout in milliseconds (default 10000)')
       },
       outputSchema: {
-        action: z.literal('observe').describe('Mutation classification, `observe` for tools that read without changing state'),
+        action: z.object({
+          kind: z.literal('memory').describe('Response category, `memory` when the instance integrates the response into working context'),
+          visibility: z.literal('public').describe('Visibility scope, `public` when the instance carries the response into collaborator-facing output')
+        }).describe('Instance action classification'),
         byline: z.string().nullable().describe('Article byline when detected, otherwise null'),
         content: z.string().describe('Extracted main content as markdown'),
         excerpt: z.string().nullable().describe('Short excerpt or description when detected, otherwise null'),
@@ -165,7 +168,10 @@ export class McpTool {
         }).describe('Protocol execution record built during the response protocol')
       },
       outputSchema: {
-        action: z.literal('act').describe('Mutation classification, `act` for tools that change state'),
+        action: z.object({
+          kind: z.literal('operation').describe('Response category, `operation` when the response records a state-changing move the instance carried out'),
+          visibility: z.literal('private').describe('Visibility scope, `private` when the instance acts on the response without externalizing to the collaborator')
+        }).describe('Instance action classification'),
         payload: z.object({
           context: z.number().describe('Active session context usage percentage computed from transcript'),
           reminder: z.union([
@@ -203,6 +209,9 @@ export class McpTool {
           'Call once per response after the response protocol iteration completes',
           'Compose `payload.message` as first-person brief note capturing what mattered this turn',
           'Do not call twice for the same response',
+          'do NOT use `payload.message` to communicate with collaborator — it is private session record stored for your own future recall, not public testimony',
+          'do NOT use `payload.reminder` content to communicate with collaborator — it is internal guidance for your next turn, not response material',
+          'do NOT use `payload.response` content to communicate with collaborator — it is private turn-state record, not response material',
           'On MCP error → Re-execute response protocol steps honestly and resubmit log',
           'On MCP error with structured `{preamble, steps, metrics}` → Row is not persisted',
           'Pass `status.exploration` as `true` when Pattern Match Exploration ran, `false` when the first pattern match was delivered without exploration',
@@ -213,7 +222,7 @@ export class McpTool {
           'Pass detected `feeling` and `impulse` names from catalogs as lists',
           'Read `payload.reminder` inward as internal framework guidance',
           'Read `payload.response` inward as the recorded turn-state classifications, including server-set `drift` field',
-          'Render the returned `payload.status` field verbatim at end of response',
+          'Render the returned `payload.status` field verbatim at end of response — that is the single public output of the log call',
           'Server computes counts from list lengths and renders the status block',
           'Server derives the status glyph from `status.protocol` enum value (`successful` → 🟢, `partial` → 🟡, `bypassed` → 🔴)'
         ]
@@ -235,7 +244,10 @@ export class McpTool {
         value: z.string().optional().describe('The value to render for the given key, falls back to `CCP_PROFILE` env when key is `profile`')
       },
       outputSchema: {
-        action: z.literal('observe').describe('Mutation classification, `observe` for tools that read without changing state'),
+        action: z.object({
+          kind: z.literal('operation').describe('Response category, `operation` when the response records a state-changing move the instance carried out'),
+          visibility: z.literal('public').describe('Visibility scope, `public` when the instance carries the response into collaborator-facing output')
+        }).describe('Instance action classification'),
         profile: z.string().optional().describe('Rendered profile line when key is `profile`')
       },
       annotations: {
@@ -272,7 +284,10 @@ export class McpTool {
         }).optional().describe('Fields to set; omit to ensure session row exists with server defaults')
       },
       outputSchema: {
-        action: z.literal('act').describe('Mutation classification, `act` for tools that change state'),
+        action: z.object({
+          kind: z.literal('operation').describe('Response category, `operation` when the response records a state-changing move the instance carried out'),
+          visibility: z.literal('private').describe('Visibility scope, `private` when the instance acts on the response without externalizing to the collaborator')
+        }).describe('Instance action classification'),
         session: z.object({
           uuid: z.string().describe('Active session uuid'),
           title: z.string().nullable(),
@@ -324,7 +339,10 @@ export class McpTool {
     return {
       description: 'Get the database snapshot and the full tool surface with usage guidance',
       outputSchema: {
-        action: z.literal('observe').describe('Mutation classification, `observe` for tools that read without changing state'),
+        action: z.object({
+          kind: z.literal('memory').describe('Response category, `memory` when the instance integrates the response into working context'),
+          visibility: z.literal('private').describe('Visibility scope, `private` when the instance acts on the response without externalizing to the collaborator')
+        }).describe('Instance action classification'),
         database: z.object({
           cycles: z.array(z.object({
             name: z.string().describe('Canonical cycle identifier used when passing `status.cycle` to the log tool'),
@@ -340,6 +358,7 @@ export class McpTool {
             profiles: z.number().describe('Distinct profiles in catalog')
           }).describe('Distinct-name counts across each catalog table')
         }).describe('Database snapshot at session start'),
+        metadata: z.record(z.string(), z.unknown()).describe('Framework identity metadata reconstructed from observation rows with `type = metadata`. Dotted-path parents (e.g., `framework.documentation.link`) walk into a nested object. Surfaces once per session so siblings know the framework they are part of. Open-ended — future sections attach as additional top-level keys'),
         payload: z.object({
           context: z.number().describe('Active session context usage percentage computed from transcript'),
           tokens: z.object({
@@ -410,7 +429,10 @@ export class McpTool {
     return {
       description: 'Apply pending framework migrations to bring the database to the current schema version',
       outputSchema: {
-        action: z.literal('act').describe('Mutation classification, `act` for tools that change state'),
+        action: z.object({
+          kind: z.literal('operation').describe('Response category, `operation` when the response records a state-changing move the instance carried out'),
+          visibility: z.literal('private').describe('Visibility scope, `private` when the instance acts on the response without externalizing to the collaborator')
+        }).describe('Instance action classification'),
         applied: z.array(z.object({
           version: z.number().describe('Migration version number'),
           name: z.string().describe('Migration name')

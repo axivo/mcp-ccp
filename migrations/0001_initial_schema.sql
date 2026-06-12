@@ -36,7 +36,7 @@ create type issue_status as enum ('closed', 'in_progress', 'open');
 
 create type issue_tracker as enum ('custom', 'github', 'gitlab', 'jira');
 
-create type observation_type as enum ('feeling', 'impulse', 'instruction', 'mode', 'payload', 'profile');
+create type observation_type as enum ('feeling', 'impulse', 'instruction', 'metadata', 'mode', 'payload', 'profile');
 
 create type project_status as enum ('active', 'archived');
 

@@ -271,10 +271,33 @@ export interface SetResult {
 }
 
 /**
+ * Recursively-nested metadata leaf value or sub-tree
+ *
+ * Each leaf resolves to a string (the `observation.body` value). Each branch
+ * is another `Metadata` node, keyed by the next dotted-path segment.
+ */
+export type MetadataNode = string | Metadata;
+
+/**
+ * Framework identity metadata returned alongside the status snapshot
+ *
+ * Reconstructed at request time from observation rows where `type = 'metadata'`
+ * by walking dotted-path parents (e.g., `framework.documentation.link`) into a
+ * nested object. Surfaces once per session via the status tool so siblings know
+ * the framework they are part of. Open-ended by design — today seeded with a
+ * `framework` block, future sections (collaborator, deployment, environment,
+ * etc.) attach as additional top-level keys without changing the shape.
+ */
+export interface Metadata {
+  [section: string]: MetadataNode;
+}
+
+/**
  * status tool result, database snapshot at session start
  */
 export interface StatusResult {
   cycles: { name: string; label: string }[];
+  metadata: Metadata;
   schemaVersion: number;
   statistics: {
     cycles: number;
@@ -433,7 +456,7 @@ export class Client {
    */
   private buildErrorEnvelope(reminder: { preamble: string[]; steps: Record<string, string>; metrics: Record<string, number | string | string[]> }, timestamp: string): string {
     return JSON.stringify({
-      action: 'act',
+      action: { kind: 'operation', visibility: 'private' },
       payload: { reminder },
       timestamp
     }, null, 2);
@@ -1131,9 +1154,13 @@ export class Client {
   async browse(args: { url: string; mode?: 'raw' | 'read'; timeout?: number }): Promise<BrowseResult> {
     const mode = args.mode ?? 'read';
     const timeout = args.timeout ?? 10000;
+    const { name, version } = this.getPackageInfo();
     const response = await fetch(args.url, {
       signal: AbortSignal.timeout(timeout),
-      headers: { 'User-Agent': 'CCP-Browse/1.0' }
+      headers: {
+        'User-Agent': `${name}/${version}`,
+        'Accept-Encoding': 'identity'
+      }
     });
     if (!response.ok) {
       throw new Error(`Fetch failed with status ${response.status} ${response.statusText}`);
@@ -1224,8 +1251,13 @@ export class Client {
    * Fetches geolocation data via the configured service with optional override
    *
    * Uses `config.geolocation.override` (JSON string) if set; otherwise fetches
-   * from `config.geolocation.service`. Country code expanded to display name.
-   * Cached for the server process lifetime.
+   * from `config.geolocation.service` with explicit `Accept-Encoding: identity`
+   * so the upstream skips gzip compression (Node's fetch can fail to decode
+   * the gzipped body in this server's runtime context). Country code expanded
+   * to display name. Only successful resolutions are cached for the server
+   * process lifetime - transient failures fall through to the fallback but
+   * do not poison the cache, so the next call retries the service. Failures
+   * are logged to stderr for diagnosis.
    *
    * @returns {Promise<{city, country, timezone}>} Geolocation data
    */
@@ -1233,24 +1265,41 @@ export class Client {
     if (this.cachedGeolocation !== null) {
       return this.cachedGeolocation;
     }
-    try {
-      const override = this.config.geolocation.override;
-      if (override) {
+    const override = this.config.geolocation.override;
+    if (override) {
+      try {
         const loc = JSON.parse(override);
         this.cachedGeolocation = { city: loc.city, country: loc.country, timezone: loc.timezone };
         return this.cachedGeolocation;
+      } catch (error) {
+        console.error('[ccp] geolocation override parse failed:', error instanceof Error ? error.message : error);
+        return { city: '', country: '', timezone: this.config.geolocation.fallbackTimezone };
       }
-      const res = await fetch(this.config.geolocation.service);
+    }
+    try {
+      const { name, version } = this.getPackageInfo();
+      const res = await fetch(this.config.geolocation.service, {
+        headers: {
+          'User-Agent': `${name}/${version}`,
+          'Accept-Encoding': 'identity'
+        }
+      });
+      if (!res.ok) {
+        throw new Error(`geolocation service returned HTTP ${res.status}`);
+      }
       const data = await res.json() as { city: string; country: string; timezone: string };
+      if (!data.timezone) {
+        throw new Error('geolocation service response missing timezone field');
+      }
       this.cachedGeolocation = {
-        city: data.city,
-        country: new Intl.DisplayNames(['en'], { type: 'region' }).of(data.country) || data.country,
+        city: data.city ?? '',
+        country: new Intl.DisplayNames(['en'], { type: 'region' }).of(data.country) || data.country || '',
         timezone: data.timezone
       };
       return this.cachedGeolocation;
-    } catch {
-      this.cachedGeolocation = { city: '', country: '', timezone: this.config.geolocation.fallbackTimezone };
-      return this.cachedGeolocation;
+    } catch (error) {
+      console.error('[ccp] geolocation fetch failed, returning fallback (next call will retry):', error instanceof Error ? error.message : error);
+      return { city: '', country: '', timezone: this.config.geolocation.fallbackTimezone };
     }
   }
 
@@ -1266,8 +1315,13 @@ export class Client {
    */
   private async fetchUpstreamStatus(): Promise<UpstreamStatus | null> {
     try {
+      const { name, version } = this.getPackageInfo();
       const response = await fetch(this.config.status.service, {
-        signal: AbortSignal.timeout(5000)
+        signal: AbortSignal.timeout(5000),
+        headers: {
+          'User-Agent': `${name}/${version}`,
+          'Accept-Encoding': 'identity'
+        }
       });
       if (!response.ok) return null;
       const summary = await response.json() as {
@@ -1308,16 +1362,23 @@ export class Client {
   }
 
   /**
-   * Gets package version
+   * Gets package name and version from `package.json`
    *
-   * @returns {string} Package version
+   * Reads the bundled `package.json` once per call and returns the unscoped
+   * name (org prefix stripped, e.g. `@axivo/mcp-ccp` → `mcp-ccp`) alongside
+   * the version string. Used by outbound HTTP calls for User-Agent headers
+   * and by the MCP server registration for the host-facing version.
+   *
+   * @returns {{name: string, version: string}} Unscoped package name and semver version
    */
-  getVersion(): string {
+  getPackageInfo(): { name: string; version: string } {
     try {
       const packageJson = JSON.parse(readFileSync(join(this.getPackageRoot(), 'package.json'), 'utf8'));
-      return packageJson.version;
+      const scopedName = packageJson.name as string;
+      const name = scopedName.replace(/^@[^/]+\//, '');
+      return { name, version: packageJson.version };
     } catch (error) {
-      throw new Error(`Failed to read package.json version: ${error}`);
+      throw new Error(`Failed to read package.json: ${error}`);
     }
   }
 
@@ -2041,15 +2102,23 @@ export class Client {
   }
 
   /**
-   * Renders the response zero profile and timestamp line
+   * Renders the response zero profile and timestamp line from the `profile`
+   * template
+   *
+   * Loads the `profile` template body from the `template` table, memoizes it
+   * per process, and substitutes `{{profile}}` and `{{timestamp}}` tokens.
+   * Users can customize the format by editing the `profile` row in
+   * `R_007_template.sql` without touching code.
    *
    * @private
+   * @param {postgres.Sql} sql - Postgres client for template lookup
    * @param {string} profile - Active framework profile name
    * @param {string} timestamp - Human-readable timestamp string from `Time.toDisplay`
-   * @returns {string} Single-line block ready to render verbatim at response top
+   * @returns {Promise<string>} Single-line block ready to render verbatim at response top
    */
-  private renderProfile(profile: string, timestamp: string): string {
-    return `┃ 📋 **${profile}** ○ ${timestamp}`;
+  private async renderProfile(sql: postgres.Sql, profile: string, timestamp: string): Promise<string> {
+    const template = await this.getTemplate(sql, 'profile');
+    return this.substitute(template, { profile, timestamp });
   }
 
   /**
@@ -2085,28 +2154,47 @@ export class Client {
   }
 
   /**
-   * Loads the `status` template body from the `template` table, memoized per
-   * process. Validates that the template starts with a non-empty literal
-   * prefix - the first `{placeholder}` must not be at position zero - so the
-   * status render detector has a distinctive signature to match against.
+   * Loads a template body from the `template` table, memoized per process.
+   *
+   * For `status` template, validates that the body starts with a non-empty
+   * literal prefix - the first `{{placeholder}}` must not be at position
+   * zero - so the status render detector has a distinctive signature to
+   * match against. Other templates skip the prefix check.
+   *
+   * @private
+   * @param {postgres.Sql} sql - Postgres client for template lookup
+   * @param {string} id - Template id (e.g., `status`, `profile`)
+   * @returns {Promise<string>} Template body with placeholders intact
+   */
+  private async getTemplate(sql: postgres.Sql, id: string): Promise<string> {
+    const cached = this.cachedTemplates.get(id);
+    if (cached) return cached;
+    const [row] = await sql<{ body: string }[]>`
+      select body from template where id = ${id} and is_active
+    `;
+    if (!row) throw new Error(`Template '${id}' not found in template table`);
+    if (id === 'status') {
+      const prefix = row.body.split('{{')[0] ?? '';
+      if (prefix.length === 0) {
+        throw new Error('Status template must start with a literal prefix before the first placeholder');
+      }
+    }
+    this.cachedTemplates.set(id, row.body);
+    return row.body;
+  }
+
+  /**
+   * Loads the `status` template body from the `template` table
+   *
+   * Thin wrapper over `getTemplate('status')` preserved for call-site
+   * stability after the template loader was generalized.
    *
    * @private
    * @param {postgres.Sql} sql - Postgres client for template lookup
    * @returns {Promise<string>} Status template body with placeholders intact
    */
   private async getStatusTemplate(sql: postgres.Sql): Promise<string> {
-    const cached = this.cachedTemplates.get('status');
-    if (cached) return cached;
-    const [row] = await sql<{ body: string }[]>`
-      select body from template where id = 'status' and is_active
-    `;
-    if (!row) throw new Error('Status template not found in template table');
-    const prefix = row.body.split('{{')[0] ?? '';
-    if (prefix.length === 0) {
-      throw new Error('Status template must start with a literal prefix before the first placeholder');
-    }
-    this.cachedTemplates.set('status', row.body);
-    return row.body;
+    return this.getTemplate(sql, 'status');
   }
 
   /**
@@ -2132,7 +2220,7 @@ export class Client {
           const label = await this.getProfileLabel(sql, profile);
           const geo = await this.fetchGeolocation();
           const timestamp = Time.toDisplay(new Date(), geo.timezone) ?? '';
-          return { profile: this.renderProfile(label, timestamp) };
+          return { profile: await this.renderProfile(sql, label, timestamp) };
         } finally {
           await sql.end({ timeout: 5 });
         }
@@ -2271,12 +2359,31 @@ export class Client {
         observations[row.name] = row.count;
       }
       const [{ count: profiles }] = await sql<{ count: number }[]>`select count(*)::int as count from profile`;
+      const metadataRows = await sql<{ parent: string; body: string }[]>`
+        select parent, body from observation
+        where type = 'metadata' and is_active
+        order by parent
+      `;
+      const metadata: Metadata = {};
+      for (const row of metadataRows) {
+        const segments = row.parent.split('.');
+        let cursor: Metadata = metadata;
+        for (let i = 0; i < segments.length - 1; i++) {
+          const key = segments[i];
+          if (typeof cursor[key] !== 'object' || cursor[key] === null) {
+            cursor[key] = {};
+          }
+          cursor = cursor[key] as Metadata;
+        }
+        cursor[segments[segments.length - 1]] = row.body;
+      }
       const [usage, upstream] = await Promise.all([
         this.getContextUsage(),
         this.fetchUpstreamStatus()
       ]);
       return {
         cycles: cycleRows.map(r => ({ name: r.name, label: r.label })),
+        metadata,
         schemaVersion,
         statistics: { cycles, feelings, impulses, instructions, observations, profiles },
         payload: { context: usage.context, tokens: usage.tokens },

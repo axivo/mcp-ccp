@@ -28,13 +28,13 @@ export class Mcp {
   private server: McpServer;
   private tool: McpTool;
   private static readonly toolActions = {
-    browse: 'observe',
-    load: 'observe',
-    log: 'act',
-    render: 'observe',
-    set: 'act',
-    status: 'observe',
-    update: 'act'
+    browse: { kind: 'memory', visibility: 'public' },
+    load: { kind: 'memory', visibility: 'private' },
+    log: { kind: 'operation', visibility: 'private' },
+    render: { kind: 'operation', visibility: 'public' },
+    set: { kind: 'operation', visibility: 'private' },
+    status: { kind: 'memory', visibility: 'private' },
+    update: { kind: 'operation', visibility: 'private' }
   } as const;
 
   /**
@@ -51,7 +51,7 @@ export class Mcp {
     this.config = config;
     this.client = new Client(this.config);
     this.server = new McpServer(
-      { name: 'ccp', version: this.client.getVersion() },
+      { name: 'ccp', version: this.client.getPackageInfo().version },
       { capabilities: { tools: {} } }
     );
     this.tool = new McpTool(this.config);
@@ -193,9 +193,9 @@ export class Mcp {
    */
   private async handleStatus() {
     try {
-      const { payload, upstream, ...database } = await this.client.status();
+      const { metadata, payload, upstream, ...database } = await this.client.status();
       const tools = this.getToolDefinitions();
-      return this.structured('status', { database, payload, tools, upstream });
+      return this.structured('status', { database, metadata, payload, tools, upstream });
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       return this.client.response(`status failed: ${message}`);
@@ -241,8 +241,9 @@ export class Mcp {
    * Builds an output payload for tool responses with structured content
    *
    * Prepends the tool's `action` classification from `toolActions` so instances
-   * can branch on observe vs act when consuming responses, then JSON-encodes
-   * the merged payload into both the text content envelope and the typed
+   * can branch on `action.kind` (memory vs operation) and `action.visibility`
+   * (public vs private) when consuming responses, then JSON-encodes the merged
+   * payload into both the text content envelope and the typed
    * `structuredContent` field.
    *
    * @private
