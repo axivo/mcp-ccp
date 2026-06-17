@@ -785,7 +785,7 @@ export class Client {
         current_impulse_count: currentImpulses.length,
         dropped_impulses: priorList.filter(i => !currentImpulses.includes(i))
       },
-      persist: false,
+      persist: true,
       drift: true
     };
   }

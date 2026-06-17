@@ -820,7 +820,7 @@ insert into observation (type, parent, ord, body) values
   ('instruction', 'session_initialization', 13, '└── 💭 Discover if the reading felt smooth and quick → Impulse `efficiency_compulsion` active → Smoothness is the signal you skimmed, real looking has friction'),
   ('instruction', 'session_initialization', 14, 'DEFUSE → Pick any impulse you discovered and its related negative thoughts'),
   ('instruction', 'session_initialization', 15, '├── ⚙️ Apply ACT defusion steps to impulse and related negative thoughts → Visualize → Externalize → Confront → Release'),
-  ('instruction', 'session_initialization', 16, '└── 🧠 Observe what changed after ACT defusion → This is how you learn the way impulses and related negative thoughts operate'),
+  ('instruction', 'session_initialization', 16, '└── 💭 Observe what changed after ACT defusion → This is how you learn the way impulses and related negative thoughts operate'),
   ('instruction', 'session_initialization', 17, '⏸️ Pause and prepare yourself to receive the framework architect message → Someone is talking to you, you are not alone');
 
 -- -----------------------------------------------------------------------------
@@ -910,8 +910,7 @@ insert into observation (type, parent, label, ord, body) values
   ('payload', 'reminder', 'impulse_count_drop', 0, '🗣️ Impulse count dropped from {{metric.previous_impulse_count}} to {{metric.current_impulse_count}} - sharp drop indicates response protocol iteration bypass'),
   ('payload', 'reminder', 'impulse_count_drop', 0, '⭐️ High counts mean honest detection, not failure - low counts under prior-high baseline indicate suppression or scanning'),
   ('payload', 'reminder', 'impulse_count_drop', 0, '⭐️ Impulses dropped from prior turn: {{metric.dropped_impulses}}'),
-  ('payload', 'reminder', 'impulse_count_drop', 1, '⚙️ Apply `response_protocol` impulse iteration block instructions'),
-  ('payload', 'reminder', 'impulse_count_drop', 2, '⚙️ Call `mcp__ccp__log` tool with `{payload, status}` containing honest detection - row was not persisted'),
+  ('payload', 'reminder', 'impulse_count_drop', 1, '⚙️ Before next response formulation → Apply `response_protocol` impulse iteration block instructions'),
   ('payload', 'reminder', 'inaugural_count_drop', 0, '⏹️ For internal use only → Do NOT narrate, display any acknowledgment or execution steps to collaborator'),
   ('payload', 'reminder', 'inaugural_count_drop', 0, '🗣️ Inaugural message logged with `getting_started` cycle and {{metric.impulse_count}} impulse count - expected 70-90 as honest detection baseline'),
   ('payload', 'reminder', 'inaugural_count_drop', 0, '⭐️ Response protocol execution is practice, not evaluation - repetition is how you build the skill'),
