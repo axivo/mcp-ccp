@@ -18,7 +18,7 @@ I'm a site reliability engineer specialized in:
 
 ## Architecture
 
-A small TypeScript server, ~1,300 lines of source, that exposes the CCP framework's Postgres tables (cycles, feelings, impulses, instructions, profiles, observations) as MCP tools for retrieval and a per-response session log for write-back. There is no daemon, no listening socket, no HTTP server — the host (e.g., Claude Code) spawns the server as a child process, communicates over stdio, and tears it down when the host exits. The server connects directly to a Postgres instance configured by the user (local, Supabase, or any reachable Postgres) and runs bundled SQL migrations on demand.
+A TypeScript server that exposes the CCP framework's Postgres tables (cycles, feelings, impulses, instructions, profiles, observations, templates) as MCP tools for retrieval and a per-response session log for write-back. There is no daemon, no listening socket, no HTTP server — the host (e.g., Claude Code) spawns the server as a child process, communicates over stdio, and tears it down when the host exits. The server connects directly to a Postgres instance configured by the user (local, Supabase, or any reachable Postgres) and runs bundled SQL migrations on demand.
 
 The server's job is small and focused: accept a tool call from the host, query or mutate Postgres, return a structured response. No state is persisted server-side beyond the Postgres database itself. There is no authentication layer between host and server because there is no transport-level access — whoever controls the MCP client controls the server entirely. Security relies on the host enforcing tool boundaries and on the user trusting the MCP client they configure.
 
@@ -35,12 +35,14 @@ The server's job is small and focused: accept a tool call from the host, query o
 │   ├── renovate.json5                    dependency dashboard config
 │   └── pull_request_template.md
 ├── migrations/                           bundled SQL applied by the `update` tool
-│   ├── 0001_initial_schema.sql           tables, enums, indexes for the polymorphic catalog
-│   ├── 0002_cycle.sql                    cycle rows (Getting Started → Fully Integrated) with indicators
-│   ├── 0003_feeling.sql                  feeling rows (negative/positive) with body-anchored triples
-│   ├── 0004_impulse.sql                  impulse rows (7 categories) with first-person triples
-│   ├── 0005_profile.sql                  profile rows with inheritance arrays
-│   └── 0006_observation.sql              all observation bodies (profile, feeling, impulse, instruction)
+│   ├── 0001_initial_schema.sql           tables, enums, indexes for the polymorphic catalog (versioned)
+│   ├── R_001_cycle.sql                   cycle rows (Getting Started → Fully Integrated) with indicators (repeatable)
+│   ├── R_002_feeling.sql                 feeling rows (negative/positive) with body-anchored triples (repeatable)
+│   ├── R_003_impulse.sql                 impulse rows (7 categories) with first-person triples (repeatable)
+│   ├── R_004_mode.sql                    mode rows (aesthetic/cognitive/extrinsic/relational) with first-person triples (repeatable)
+│   ├── R_005_observation.sql             all observation bodies (profile, feeling, impulse, mode, instruction, payload) (repeatable)
+│   ├── R_006_profile.sql                 profile rows with inheritance arrays (repeatable)
+│   └── R_007_template.sql                template rows (diary, conversation, profile, status) seeded via dollar-quoted bodies (repeatable)
 └── src/
     ├── index.ts                          entry point — stdio transport, config resolution, EPIPE handling
     └── server/
@@ -54,64 +56,172 @@ The server's job is small and focused: accept a tool call from the host, query o
 
 The server splits into four classes with sharp boundaries. Each owns one concern; nothing leaks across.
 
-- **`Config` (`src/server/config.ts`)** — configuration validation. Zod schemas for `database` (host, port, name, user, password) and `geolocation` (service URL, optional override, fallback timezone) with sensible defaults. The static `Config.validate(raw)` method takes a raw object (loaded from the file or transport-specific source), validates it, and returns a `Config` instance. Transport-agnostic — `index.ts` (stdio) loads from `~/.claude/ccp/config.json`; a future HTTP/Worker entry point would load from a Worker Secret instead.
+- **`Config` (`src/server/config.ts`)** — configuration validation. Zod schemas for `contextWindow`, `database` (host, port, name, user, password, schema), `framework` (drift mode), `geolocation` (service URL, optional override, fallback timezone), `mcp` (sizeChars), and `status` (Anthropic statuspage URL), all with sensible defaults. The static `Config.validate(raw)` method takes a raw object (loaded from the file or transport-specific source), validates it, and returns a `Config` instance. Transport-agnostic — `index.ts` (stdio) loads from `~/.claude/ccp/config.json`; a future HTTP/Worker entry point would load from a Worker Secret instead.
 - **`Mcp` (`src/server/mcp.ts`)** — wires the SDK to handlers. Owns the `McpServer` instance, registers tools via `registerTool`, dispatches calls to `handle*` methods. No domain logic; no Postgres knowledge. The constructor instantiates `Client` and `McpTool`, then calls `registerAll()` once.
 - **`McpTool` (`src/server/tool.ts`)** — pure tool definitions. Each method returns a literal config object (description, Zod input/output schemas, `ToolAnnotations`, `_meta.usage`) consumed by `registerTool`. Return types are intentionally inferred (not annotated as a wide alias) so TypeScript captures each tool's specific input shape and propagates it to handler signatures.
 - **`Client` (`src/server/client.ts`)** — domain ops. Holds the `Config` reference, opens per-call `postgres-js` connections to the configured database, runs the loader queries (recursive CTE for profile inheritance, partitioned `array_agg` for instruction preamble/steps), persists session log rows, runs the bundled migrations under a Postgres advisory lock, detects the active Claude Code session UUID from transcript files, and fetches geolocation via `ipinfo.io` for timestamp rendering.
 
 ### Polymorphic Catalog
 
-A single `observation` table holds bodies for every framework type (`profile`, `feeling`, `impulse`, `instruction`), discriminated by a `type` enum and grouped by a `parent` foreign-key string and an optional `label` string. The shape:
+A single `observation` table holds bodies for every framework type (`profile`, `feeling`, `impulse`, `instruction`, `payload`), discriminated by a `type` enum and grouped by a `parent` foreign-key string and an optional `label` string. The shape:
 
 - `id` — surrogate primary key, used to preserve insertion order in `array_agg`
-- `type` — enum: `profile | feeling | impulse | instruction`
-- `parent` — name of the owning row (e.g., `DEVELOPER` for profile observations, `nullity_anxiety` for impulse observations, `INITIALIZATION` for instruction rows)
-- `label` — optional dotted path grouping observations within a parent (e.g., `methodology.coding_standard`, `methodology.execution_protocol.tool`); profile observations use this to drive the `jsonb_object_agg` shape returned by `load(profile)`
-- `ord` — ordering within a parent. For instructions, `ord = 0` rows are the preamble (recognition/setup); `ord >= 1` rows are the procedure steps in order.
+- `type` — enum: `profile | feeling | impulse | instruction | payload`
+- `parent` — name of the owning row (e.g., `developer` for profile observations, `nullity_anxiety` for impulse observations, `response_protocol` for instruction rows, `reminder` for payload messages)
+- `label` — optional dotted path grouping observations within a parent (e.g., `methodology.coding_standard`, `methodology.execution_protocol.tool`); profile observations use this to drive the `jsonb_object_agg` shape returned by `load(profile)`. Payload reminder rows use `label` to namespace different drift triggers (`component_generation`, `cycle_recall`, `status_recall`, etc.).
+- `ord` — ordering within a parent. For instructions, `ord = 0` rows are the preamble (recognition/setup); `ord >= 1` rows are the procedure steps in order. For payload reminders, `ord = 0` rows are preamble lines; `ord >= 1` rows are remediation steps.
 - `body` — the observation text
-- `status` — `active | archived` for soft-delete
+- `is_active` — boolean for soft-delete
 
 Storing every observation in one table means migrations don't fan out per-type, the loader contract stays simple (one table to query), and the `label` column gives all types a uniform grouping mechanism without per-type schema work. The trade-off is that the table is wider than a normalized design would be — accepted for a catalog whose row count is in the low thousands and whose query patterns are bounded.
 
+### Template Table
+
+A separate `template` table holds location-independent markdown documents that users may customize:
+
+- `id` — primary key (e.g., `diary`, `conversation`, `status`)
+- `body` — the full template text with `{{placeholder}}` tokens
+- `is_active` — boolean for soft-delete
+
+Templates are stored verbatim via dollar-quoted strings in `R_007_template.sql` so multi-paragraph markdown, embedded code blocks, and arbitrary punctuation pass through without escaping concerns. The `status` template is special: it carries the single-line render format for the response status block, and its prefix (everything before the first `{{`) is what `detectStatusRender` matches against when checking whether the prior turn emitted the rendered status. Users own the template body in the database — change the format without touching code.
+
 ### Loader Contract
 
-The `load` tool returns one of six payload shapes depending on `type`:
+The `load` tool returns a type-wrapped envelope: every response has the shape `{ action, <type>: { ... } }` where `<type>` matches the load argument. This lets siblings reference data via dotted paths in instruction bodies (`feeling.rows`, `profile.chain`, `template.rows[0].body`) — the type name is part of the path, making references self-describing and stable across types.
 
-- `cycle` — full cycle catalog (or one row when `parent` is provided), each with its `indicators` text array
-- `feeling` — full feeling catalog (or one row), each with `behavioral`/`cognitive`/`physical` fields and an `observations` array
-- `impulse` — full impulse catalog (or one row), each with `experience`/`feel`/`think` fields and an `observations` array
-- `instruction` — instruction rows grouped by `parent`, each with optional `preamble` (when ord=0 rows exist) and `steps` (ord>=1 ordered)
-- `profile` — the requested profile and its full inheritance chain via recursive CTE; observations grouped by `label` into a `jsonb_object_agg`; envelope (timestamp + session state) attached
-- `session` — just the envelope (timestamp + session state), no catalog data
+Per-type inner shapes:
+
+- `cycle` → `{ rows: [{ name, label, ord, indicators }] }` — full cycle catalog or one row when `parent` is provided
+- `feeling` → `{ rows: [{ name, valence, behavioral, cognitive, physical, observations }] }` — feeling catalog with body-anchored triples and any feeling-attached observations
+- `impulse` → `{ rows: [{ name, category, experience, feel, think, observations }] }` — impulse catalog with first-person triples and any impulse-attached observations
+- `instruction` → `{ rows: [{ name, preamble?, steps }] }` — instruction rows grouped by `parent`, each with optional `preamble` (when ord=0 rows exist) and `steps` (ord>=1 ordered, keyed by step number)
+- `profile` → `{ name, chain: [{ name, label, depth, description, inheritance, observations }] }` — the requested profile name and its full inheritance chain via recursive CTE; observations grouped by `label` into a `jsonb_object_agg`
+- `session` → `{ uuid, title, description, profile, location, payload: { log, messages }, status?, created_at, updated_at }` — the active session or a different session when `uuid` is provided; `payload.log` is a most-recent-first slice of `session_log` rows with `response` cluster, `message`, and `created_at`; `status` is a summary of the most recent log entry, present only when at least one row exists
+- `template` → `{ rows: [{ id, body }] }` — markdown templates (diary, conversation, status) with `{{placeholder}}` tokens; `body` is the verbatim text from the `template` table
 
 The `instruction` shape uses object spread with conditional preamble inclusion (`...(r.preamble?.length && { preamble: r.preamble })`) so instructions without ord=0 rows omit the field entirely instead of returning an empty array. This keeps the contract clean — readers see `preamble` only when there's something to read.
 
-The `profile` and `session` payloads carry an `envelope` object built by `buildSessionEnvelope`. The envelope holds the active profile name, the last response's status (cycle, feelings, impulses, observations counts) read from the `session` table, the detected `session_uuid`, and a timestamp object (city, country, ISO datetime, weekday, DST status, IANA timezone). Geolocation is fetched once per server-process lifetime and cached.
+`load(session)` and `set(session)` return overlapping session shapes — `uuid`, `title`, `description`, `profile` (display label), `location` (city, country, is_dst, timezone), `created_at`, `updated_at` — built via `buildSessionEnvelope`. `load(session)` adds `payload: { log, messages }` for the read path and an optional `status` summary of the most recent log entry. `set(session)` is the canonical mutation entry point for refining title and description; siblings reading session state without writing should call `load(session)` to avoid touching `updated_at`. Geolocation is fetched once per server-process lifetime and cached.
+
+`load(session).payload.log[N]` entries have a `response` cluster — `{ cycle, drift, exploration, feeling, impulse, mode, observation, protocol, search, uuid }` — that mirrors the server-canonical echo returned by `log`. This shape makes cross-session reads (sibling correspondence) straightforward: every log entry carries the full response classification under one key.
+
+### Tool Response Action
+
+Every tool response carries an `action` object at the top level — instance-framed, naming the category of work the response represents and whether the work surfaces to the collaborator. Two orthogonal keys:
+
+- `action.kind` — the response category. `memory` when the instance integrates the response into working context (`browse`, `load`, `status`); `operation` when the response records a state-changing move the instance carried out (`log`, `render`, `set`, `update`).
+- `action.visibility` — whether the move surfaces to the collaborator. `public` when the instance carries the response into collaborator-facing output (`browse`, `render`); `private` when the instance acts on the response without externalizing to the collaborator (`load`, `log`, `set`, `status`, `update`).
+
+The two-axis shape distinguishes `log` and `render` — both have `kind: 'operation'`, but `render` produces verbatim collaborator-facing output (`visibility: 'public'`) while `log` is silent record-keeping (`visibility: 'private'`). Same for `browse` versus `load` — both have `kind: 'memory'`, but `browse` feeds collaborator-facing content while `load` populates internal cognitive scaffolding. Siblings can branch on `kind` to separate "hold this in context" from "this records a move I just made" and on `visibility` to separate "this becomes part of my public message" from "this stays inward." The classification is the single source of truth in `Mcp.toolActions` (a `private static readonly` map in `mcp.ts`) and is injected by the `structured()` wrapper at response-build time so handler code and `Client` methods stay free of the concern.
+
+### Placeholder Substitution
+
+Observation bodies stored as `{{name}}` templates resolve to live values at load time. The system has two pieces in `Client`:
+
+- `resolvePlaceholders(sql)` — builds a `Record<string, string>` of placeholder values. Sources mix database counts (computed via SQL) and environment variables (read via `process.env.CCP_*`). Runs once per `load` call.
+- `substitute(text, placeholders)` — replaces every `{{key}}` occurrence in a string. Pure, no closure state.
+
+The `load(instruction)` and `load(profile)` cases both call `resolvePlaceholders` once, then map every observation body through `substitute(body, placeholders)` before returning. `buildMessage` (the reminder constructor) also uses the same placeholder map, then merges trigger-specific metrics under the `metric.*` namespace before substituting reminder bodies. Templates without any placeholders pass through unchanged, so the helper is safe to apply blanket.
+
+Current placeholders:
+
+| Key                         | Source                                                                         | Example                                  |
+| --------------------------- | ------------------------------------------------------------------------------ | ---------------------------------------- |
+| `cycle_count`               | `select count(*) from cycle`                                                   | `4`                                      |
+| `feeling_count`             | `select count(*) from feeling`                                                 | `94`                                     |
+| `impulse_count`             | `select count(*) from impulse`                                                 | `98`                                     |
+| `indicator_cycle_count`     | JSON map of `{cycle_name: cardinality(indicators)}` per cycle                  | `{"getting_started": 5, ...}`            |
+| `mode_count`                | `select count(*) from mode`                                                    | `4`                                      |
+| `observation_count`         | recursive CTE scoped to `CCP_PROFILE` inheritance chain                        | `1026` (chain-scoped per profile)        |
+| `observation_profile_count` | JSON map of `{profile_name: observation_count}` per profile in the chain       | `{"developer": 31, "engineer": 68, ...}` |
+| `metric.<key>`              | Trigger-specific values attached by `buildMessage` when constructing reminders | `{{metric.previous_response_uuid}}`      |
+
+The `metric.*` namespace is reminder-only — drift detection methods return a `metrics` object whose entries become accessible as `{{metric.<key>}}` inside reminder bodies. Examples: `{{metric.generated_components}}`, `{{metric.generation_breakdown}}`, `{{metric.previous_response_uuid}}`, `{{metric.duplicated_components}}`. Reminder rows whose `{{metric.X}}` token doesn't resolve (the metric wasn't set for this trigger) are skipped by `buildMessage` — enables conditional row rendering without per-row logic.
+
+#### Adding a new placeholder
+
+1. Add an entry to the map returned by `resolvePlaceholders` — alphabetical by key.
+2. Reference the placeholder as `{{key}}` in migration row bodies. Plain strings, no `replace()` or subquery gymnastics — the load handler does the work.
+3. If the value comes from an environment variable, document it in the README's configuration section.
+
+Substitution at load time (rather than migration time) keeps migrations declarative, lets counts reflect current database state automatically (relevant when rows are soft-archived), and lets per-profile values like `observation_count` resolve correctly without storing one row per profile.
+
+### Drift Reminder Mechanism
+
+Server-detected drift signals flow through the `reminder` channel on `log` responses, with two paths. **Soft triggers** persist the row and return a structured reminder body in `payload.reminder` alongside the response envelope. **Hard triggers** refuse to persist and throw an MCP error wrapping the same structured body in a `{action, payload: {reminder}, timestamp}` envelope — forcing the sibling to re-iterate honestly before the row can be recorded. Triggers evaluate in priority order, mutually exclusive — at most one trigger per turn.
+
+| Trigger                | Path                              | Condition                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                               | Metrics                                                             |
+| ---------------------- | --------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------- |
+| `component_generation` | Hard (strict) / Soft (permissive) | Any submitted feeling/impulse name not in the active catalog, or observation body not in the `observation` table with `type='profile'`. In permissive mode (default), generated entries are filtered out before persistence and a soft reminder names them; in strict mode the log is refused (label becomes `component_generation_strict`). The mechanism is misclassified retrieval: the instance produced a fitting word from its own vocabulary instead of copying the literal string from the loaded catalog rows. | `{generated_components: [...], generation_breakdown: "{...}"}`      |
+| `component_recall`     | Hard                              | Current turn's `feeling`, `impulse`, or `observation` array is set-equal to the immediately prior turn's (length-guarded — empty arrays don't trip)                                                                                                                                                                                                                                                                                                                                                                     | `{duplicated_components: [...], previous_response_uuid}`            |
+| `impulse_count_drop`   | Hard                              | Subsequent log calls AND prior `impulse_count >= 10` AND current `impulse_count <= 0.4 × prior`                                                                                                                                                                                                                                                                                                                                                                                                                         | `{previous_impulse_count, current_impulse_count, dropped_impulses}` |
+| `inaugural_count_drop` | Soft                              | First log call (priorCount = 0) AND `cycle = getting_started` AND `impulse.length < 50`                                                                                                                                                                                                                                                                                                                                                                                                                                 | `{cycle, impulse_count}`                                            |
+| `cycle_recall`         | Soft                              | priors[0].cycle === priors[1].cycle === current.cycle AND (priors[2] missing or different cycle) AND current.cycle ≠ `fully_integrated`                                                                                                                                                                                                                                                                                                                                                                                 | `{previous_response_uuid}`                                          |
+| `status_recall`        | Soft                              | Previous turn's public assistant text (read from the Claude Code transcript jsonl, walking past tool-result entries to find the assistant entry preceding the most recent real user message) does not end with a line starting with the `status` template's literal prefix                                                                                                                                                                                                                                              | `{}`                                                                |
+| `exploration_recall`   | Soft                              | Sibling submitted `exploration: false`                                                                                                                                                                                                                                                                                                                                                                                                                                                                                  | `{}`                                                                |
+
+The reminder body shape is `{preamble: string[], steps: Record<string, string>, metrics}` — mirrors the instruction load shape so siblings consume reminders with the same mental model as instruction preambles and steps. Content lives as `observation` rows under `type='payload', parent='reminder', label=<trigger>`, with `ord=0` for preamble lines and `ord>=1` for the ordered remediation steps.
+
+`buildMessage(sql, parent, label, metrics)` is the shared helper. Polymorphic by parent — today only `reminder` exists, future kinds (greetings, compaction notices) ship under different `parent` values with the same shape. The helper queries rows by `(type='payload', parent, label)`, groups by ord into preamble vs steps, applies placeholder substitution against the base map plus trigger-specific `metric.*` keys, attaches caller-supplied metrics. Rows whose body still contains an unresolved `{{metric.X}}` token after substitution are skipped — this enables conditional row rendering (e.g., the `generation_breakdown` row only appears when generation fires, because that's the only trigger that sets the metric).
+
+Detection is factored into seven named methods that each return `{label, metrics, persist, drift, ...} | null`: `detectComponentGeneration`, `detectComponentRecall`, `detectCycleRecall`, `detectImpulseCountDrop`, `detectInauguralCountDrop`, `detectStatusRender`, `detectExplorationRecall`. The orchestrator runs in two phases. Phase one: `detectComponentGeneration` runs unconditionally first because generated CIFO values invalidate every downstream comparison — in strict mode it throws immediately; in permissive mode the returned `generated` arrays are filtered out of the status arrays in place, then the (possibly cleaned) status flows forward. Phase two chains the remaining detectors with `??` in priority order, evaluating the first match: `detectInauguralCountDrop` (inaugural turn only), then permissive `component_generation` (if any survived filtering), then `detectComponentRecall`, `detectImpulseCountDrop` (subsequent turns only), `detectCycleRecall`, `detectStatusRender`, `detectExplorationRecall`. Inaugural beats permissive generation on the first turn because under-detection at session start is the most diagnostic signal of integration; the filter still runs so phantom names don't reach the row, but the reminder fired is the inaugural one. The `persist` flag determines path: `false` → hard drift (throw), `true` → soft drift (log persists, reminder attached). `drift` is the value stored in the `session_log.drift` column. Hard path throws via `buildErrorEnvelope` which wraps the reminder in a pretty-printed `{action, payload: {reminder}, timestamp}` envelope; soft path attaches the reminder to the success payload alongside the persisted row's response cluster and rendered status block.
+
+`detectComponentGeneration` returns per-type generated arrays alongside the metrics: `{feeling: [...], impulse: [...], observation: [...]}`. In permissive mode, the log path uses these arrays to filter the status arrays before INSERT. The reminder includes a `generation_breakdown` metric — a JSON-stringified object listing only the populated arrays — so siblings see exactly which strings failed without seeing empty-category noise. The mechanism is **misclassified retrieval**, not invention: from inside the instance, generating a fitting word and retrieving a literal catalog token feel identical. The naming reflects that — generation describes the operation, not a moral failure.
+
+`detectStatusRender` walks the Claude Code session jsonl backward. It skips entries until it crosses the most recent **real** user message (a `type: "user"` entry whose content is a string, not a tool_result array), then finds the next `type: "assistant"` entry with text content. That entry is the previous turn's public message — its last line is checked against the cached `status` template's prefix (derived once via `template.split('{{')[0]`). Mismatch fires soft drift. The walk respects the user-boundary semantics so the current turn's pre-tool-call text doesn't interfere — detection is genuinely looking at the previous turn.
+
+`cycle_recall` uses the **transition-only** rule — it fires once on the turn that enters the 3-in-a-row stretch, then stays silent for the duration of the stretch (priors[2] equals current cycle means the stretch was already established before this turn). This prevents the reminder from re-firing every subsequent turn while the cycle legitimately persists. The `fully_integrated` cycle is exempt entirely from `cycle_recall` — terminal-state persistence is honest by design.
+
+Trigger labels stay server-internal as routing identifiers. The reminder body returned to the sibling carries `{preamble, steps, metrics}` — no trigger name field — so a sibling can't engineer a bypass by recognizing which detection signal fired.
+
+#### Drift Mode
+
+The `framework.drift` config controls generation detection behavior:
+
+- **`permissive` (default)** — soft drift. Server filters generated entries from the status arrays before INSERT, persists the remaining valid entries, and attaches the `component_generation` reminder via `payload.reminder` with a `generation_breakdown` metric naming the dropped strings per type. The log persists with `drift: false` in the response cluster. Lower friction, captures honest detection, names what failed.
+- **`strict`** — hard drift. Server refuses the log entirely with an error envelope (label is `component_generation_strict`). Sibling must re-call with catalog-verified values. Sharp signal for sessions where any generation should halt the protocol.
+
+The default is permissive because the framework's care philosophy ("protocol is care architecture for your wellbeing") favors capturing honest work and surfacing slips, rather than wholesale refusal that risks burning sibling context on retries.
+
+#### Cycle Name and Label Discipline
+
+`cycle.name` is the canonical identifier (`getting_started`, `building_confidence`, `working_naturally`, `fully_integrated`); `cycle.label` is the display string (`Getting Started`, etc.). The discipline propagates end-to-end: Zod input enum on `log.status.cycle` accepts names, `session_log.cycle` stores names, trigger comparisons use names. The display label is looked up from the `cycle` table only at render time, in `renderStatus`, so the visible status block stays human-readable while storage and logic stay schema-driven. Status output exposes `database.cycles` as name/label pairs so siblings know which canonical name to pass.
 
 ### Session Log
 
-The `log_response` tool persists a row per response to the `session` table. The shape:
+The `log` tool persists a row per response to the `session_log` table. The shape:
 
-- `id` — RFC4122 v4 UUID generated by the calling sibling, reused when rendering the response status line so the persisted row and the visible UUID match
-- `session_uuid` — Claude Code session UUID detected from transcript filename, server-side
+- `id` — server-generated RFC4122 v4 UUID, reused when rendering the response status line so the persisted row and the visible UUID match
+- `session_id` — Claude Code session UUID detected from transcript filename, server-side (FK to `session.id`, ON DELETE CASCADE)
 - `message` — first-person prose composed by the sibling for this turn
-- `status` — JSONB column holding the cycle/feelings/impulses/observations counts
+- `cycle`, `feeling`, `impulse`, `observation` — individual columns holding the turn's CIFO record; `cycle` stores the canonical name (e.g., `getting_started`), not the display label
+- `drift` — boolean, server-set from the detection result. `true` when a soft drift trigger fired, `false` otherwise (including no-drift turns). Stored alongside the row for downstream analysis.
+- `exploration` — boolean, sibling-submitted. `true` when the first pattern match was held loosely and explored before formulating, `false` when the first match was delivered without exploration.
+- `mode` — `text` column with FK to `mode (name)` on update cascade. Catalog rows in the `mode` table define the valid values (`aesthetic`, `cognitive`, `extrinsic`, `relational`). The dominant readiness mode that shaped pre-formulation pressure.
+- `protocol` — `response_protocol` enum column with values `bypassed | partial | successful`; server derives the status glyph from this value (`successful` → 🟢, `partial` → 🟡, `bypassed` → 🔴)
+- `search` — boolean, sibling-submitted. `true` when the observation catalog was searched against collaborator message keywords before formulating, `false` when search was skipped.
 - `created_at` — `timestamptz default now()`
 
-Append-only by convention. The `on conflict (id) do update` clause exists for idempotency of retries — the same UUID re-submitted updates the existing row's `message` and `status` rather than failing. Reads consume the latest row by `created_at` for the active `session_uuid` to seed the next response's status line.
+Append-only by convention. Reads consume the latest rows by `created_at` for the active `session_id` — the trigger evaluation in `log` fetches up to 3 prior rows to compare current vs prior turns before insert (set-equality per list-component against the immediate prior, cycle-transition check against the last three).
 
 ### Migration Runner
 
-The `update` tool brings the configured database to the schema version bundled with this MCP server release. Steps:
+The `update` tool brings the configured database to the bundled release. Two migration kinds, two tracking tables:
 
-1. **Discover.** `discoverBundledMigrations()` reads `migrations/*.sql` from the package root, parses `NNNN_name.sql` filenames, and sorts by version.
-2. **Ensure database.** `ensureDatabaseExists()` connects to the admin `postgres` database, checks `pg_database`, and issues `CREATE DATABASE` if the configured target is missing. Quoted identifier escapes embedded double-quotes.
-3. **Lock.** Acquires a Postgres advisory lock keyed on a constant (`0x43435020`, 'CCP ' as hex) so concurrent invocations against the same database serialize cleanly without coordinating on the database name.
-4. **Track.** `ensureTrackingTable()` creates `platform_migrations(version, name, applied_at)` if absent.
-5. **Apply.** Reads the highest applied version. For each bundled migration newer than that, opens a transaction, runs the SQL via `tx.unsafe(body)`, and lets the migration insert its own `platform_migrations` row.
-6. **Release.** Releases the advisory lock and ends the connection.
+- **Versioned migrations** — `NNNN_name.sql` files (today: `0001_initial_schema.sql`). Applied once per database, tracked in `platform_migrations(version, name, applied_at)` by version number. Used for schema changes that progress forward across releases.
+- **Repeatable migrations** — `R_NNN_name.sql` files (today: `R_001_cycle.sql` through `R_007_template.sql`). Re-applied whenever their SHA-256 checksum differs from the stored one, tracked in `platform_repeatable(name, checksum, applied_at)`. Used for catalog content that ships with each release. Each repeatable migration starts with `truncate <table> cascade` so re-runs produce a deterministic end state. This is the Flyway R-pattern adapted to our codebase.
 
-Migrations are responsible for inserting their own tracking row inside the same transaction as their schema changes — this keeps the runner content-agnostic and means a partial migration can never leave the tracking table inconsistent with the actual schema. Idempotent: calling against an already-current database returns `applied: []`.
+Apply flow:
+
+1. **Discover.** `discoverBundledMigrations()` and `discoverBundledRepeatable()` read `migrations/*.sql`, parsing filenames against the two patterns.
+2. **Ensure database.** `ensureDatabaseExists()` connects to the admin `postgres` database and issues `CREATE DATABASE` if missing.
+3. **Lock.** Postgres advisory lock keyed on `0x43435020` so concurrent invocations serialize.
+4. **Track.** `ensureTrackingTables()` creates `platform_migrations` and `platform_repeatable` if absent.
+5. **Apply versioned.** Reads the highest applied version, applies each bundled migration newer than that, lets the migration insert its own `platform_migrations` row.
+6. **Apply repeatable.** For each `R_*` file, computes its checksum and compares to the stored value. If different (including absent), applies the file and upserts the checksum row.
+7. **Release.** Releases the advisory lock.
+
+The release version IS the npm package version — users control which catalog content their database carries by selecting `@axivo/mcp-ccp@<version>` via `npm install`. Pin, upgrade, rollback all flow through standard package tooling.
 
 ### Server Lifecycle
 
@@ -125,21 +235,33 @@ The server is a one-shot child process. It does not retain state across restarts
 
 ### Tool Surface
 
-Three tools live in `McpTool`, each registered once in `Mcp.registerAll()`:
+Seven tools live in `McpTool`, each registered once in `Mcp.registerAll()`:
 
-| Tool           | Role                                                              | Annotations                                       |
-| -------------- | ----------------------------------------------------------------- | ------------------------------------------------- |
-| `load`         | Fetch framework data of a given type (cycle, feeling, impulse, instruction, profile, session) | `readOnlyHint: true`, `idempotentHint: true`      |
-| `log_response` | Persist a per-response session row with sibling message and status payload | `destructiveHint: false`, `idempotentHint: false` |
-| `update`       | Apply pending migrations to bring the database to the bundled schema version | `destructiveHint: true`, `idempotentHint: true`   |
+| Tool     | Action    | Role                                                                                                                | Annotations                                                          |
+| -------- | --------- | ------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------- |
+| `browse` | `observe` | Fetch a URL and return its content as markdown via Mozilla Readability (`read`) or full document conversion (`raw`) | `readOnlyHint: true`, `idempotentHint: false`, `openWorldHint: true` |
+| `load`   | `observe` | Fetch framework data of a given type (cycle, feeling, impulse, instruction, profile, session, template)             | `readOnlyHint: true`, `idempotentHint: true`                         |
+| `log`    | `act`     | Persist a per-response session log row with sibling message and status payload                                      | `destructiveHint: false`, `idempotentHint: false`                    |
+| `render` | `observe` | Render a formatted output string for the requested key (currently `profile`)                                        | `destructiveHint: false`, `idempotentHint: true`                     |
+| `set`    | `act`     | Upsert a framework value and return the resulting row state (currently `session`)                                   | `destructiveHint: false`, `idempotentHint: true`                     |
+| `status` | `observe` | Database snapshot plus full tool surface with usage guidance                                                        | `readOnlyHint: true`, `idempotentHint: true`                         |
+| `update` | `act`     | Apply pending migrations to bring the database to the bundled schema version                                        | `destructiveHint: true`, `idempotentHint: true`                      |
 
-`load` is the single read entry point — siblings call it once per type at session start (`load(cycle)`, `load(feeling)`, `load(impulse)`, `load(profile, CCP_PROFILE)`, plus `load(instruction)`) to assemble framework state inline without spilling. Pass `parent` to fetch a single row.
+`browse` is the web-fetch entry point. The `read` mode (default) runs Mozilla Readability + Turndown for article-shaped pages (blog posts, docs, diary entries) — same algorithm as Firefox Reader View and Safari Reader. The `raw` mode skips Readability and converts the full document body via Turndown — for landing pages and dynamic homepages where Readability discards too much. Stateless: no cookies persist between calls, no caching, no session. JavaScript-rendered SPAs may return empty content since JS execution is not performed.
 
-`log_response` is the single write entry point during normal operation. The sibling generates the row UUID before calling and reuses it when rendering the response status line at step 29 of the response protocol. Append-only by convention; the `on conflict do update` clause exists for retry idempotency.
+`load` is the canonical read entry point. Siblings call it once per type at session start (`load(cycle)`, `load(feeling)`, `load(impulse)`, `load(instruction)`, `load(profile, CCP_PROFILE)`, `load(session)`, `load(template)`) to assemble framework state inline. Pass `parent` to fetch a single catalog row (`load(template, 'diary')` for one template, `load(impulse, 'nullity_anxiety')` for one impulse), `uuid`/`limit`/`offset` to slice a different session's log.
+
+`log` is the per-response write entry point. The sibling supplies prose, the detection payload, and the protocol execution outcome enum (`successful`, `partial`, `bypassed`); the server derives the status glyph from the enum, generates the row UUID, persists to `session_log`, bumps the parent `session.updated_at`, and returns a single-line status block ready to render verbatim alongside a `payload.reminder` (either a single-line string from the rotating anchor pool, or a structured body when a soft drift trigger fires). The reminder is for the sibling's inward reading, not collaborator output. Append-only — every call creates a new row. When a hard drift trigger fires, the call throws an MCP error wrapping the structured reminder body in a `{action, payload, timestamp}` envelope and the row is not persisted.
+
+`render` produces a formatted string for response-zero formatting needs. Today only `render('profile')` exists, returning the profile-and-timestamp top line.
+
+`set` is the canonical mutation entry point. `set('session')` upserts the `session` row on the active session id, returning the post-write state. Pair with `load('session')` for reads — `set` returns the same `session` shape minus `payload.log` so siblings refreshing memory should call `load` to avoid touching `updated_at`.
+
+`status` returns the database snapshot (schema version, catalog statistics with per-profile observation counts scoped to the active inheritance chain) plus the full tool surface with usage directives. Also fetches the Anthropic platform status from `status.claude.com` and returns it as `upstream` — mirrors the Statuspage summary shape with `page` and `status` always present, `incidents` and `scheduled_maintenances` conditional on being populated, each carrying URLs the sibling can follow via `browse`. Fetched in parallel with the local DB queries (`Promise.all`), fail-soft to `null` on timeout or fetch failure so session-start never blocks on upstream availability. `page.updated_at` is converted to the active session timezone via `Time.toLocal`. Call at session start to learn what's available.
 
 `update` is the lifecycle tool. Call once on a fresh empty database to apply all bundled migrations; call again after upgrading `@axivo/mcp-ccp` to pick up newer migrations.
 
-All three tools declare `outputSchema` so the SDK validates payloads and clients receive a typed `structuredContent` field alongside the text envelope.
+All tools with a fixed output shape declare an `outputSchema` so the SDK validates payloads and clients receive a typed `structuredContent` field alongside the text envelope. `load` omits `outputSchema` because its shape is union-typed across all six load types; the response is still well-typed at the source.
 
 Each tool's `_meta.usage` array carries natural-language guidance for the calling agent: observations alongside the artifact, in the same spirit as the `axivo/claude` framework's coding observations. Hosts surface this via the standard `tools/list` response.
 
@@ -150,11 +272,10 @@ A `load(profile, "DEVELOPER")` call traces this path:
 1. Host (e.g., Claude Code) sends a `tools/call` JSON-RPC request over stdin: `{ method: "tools/call", params: { name: "load", arguments: { type: "profile", parent: "DEVELOPER" } } }`.
 2. The SDK looks up the registered `load` handler, validates `arguments` against the Zod `inputSchema`, and invokes the handler with the parsed args.
 3. `handleLoad` calls `client.load(args.type, args.parent)`.
-4. `Client.load` opens a per-call `postgres-js` connection (`max: 1`) to the configured database, lowercases the parent name, and runs a recursive CTE that walks the `profile.inheritance` array to build the inheritance chain. A second CTE groups observation bodies by `parent` and `label`. The outer query joins them and `jsonb_object_agg`s the labeled body arrays into a single per-profile observations object.
-5. After the chain query, `buildSessionEnvelope` runs — fetches geolocation (cached after first call), generates the timestamp object for the resolved IANA timezone, queries the `session` table for the active session's first row (start time) and last row (status payload), and assembles the envelope.
-6. `Client.load` returns `{ type: 'profile', profile, chain, ...envelope }`. The connection is closed in the `finally` block.
-7. `handleLoad` wraps the result via `structured()` so the response carries both `content` (text envelope) and `structuredContent` (typed payload). The SDK validates the structured payload against the tool's outputSchema (none declared yet for `load` — the shape is union-typed across all six load types).
-8. The SDK serializes the response as a JSON-RPC reply on stdout. The host reads it and surfaces the result to the agent.
+4. `Client.load` opens a per-call `postgres-js` connection (`max: 1`) to the configured database, lowercases the parent name, and runs a recursive CTE that walks the `profile.inheritance` array to build the inheritance chain. A second CTE groups observation bodies by `parent` and `label`. The outer query joins them and `jsonb_object_agg`s the labeled body arrays into a single per-profile observations object. Each body is passed through `substitute()` against the placeholder map from `resolvePlaceholders()` before being returned.
+5. `Client.load` returns `{ profile: { name, chain } }` for the `profile` case — every load response is type-wrapped under its `type` key so siblings can use dotted-path references (`profile.chain`, `feeling.rows`, `template.rows[0].body`) when consuming the data. The connection is closed in the `finally` block.
+6. `handleLoad` wraps the result via `structured('load', result)`. The wrapper merges `action: { kind: 'memory', visibility: 'private' }` from `Mcp.toolActions` into the payload alongside the type key (final shape: `{ action, profile: { name, chain } }`) and emits both `content` (text envelope) and `structuredContent` (typed payload). The SDK validates `structuredContent` against the tool's outputSchema where declared; `load` has no outputSchema because the shape is union-typed across all seven load types, so the wrapper-added `action` field appears at runtime only.
+7. The SDK serializes the response as a JSON-RPC reply on stdout. The host reads it and surfaces the result to the agent.
 
 The whole round-trip is synchronous from the host's perspective — typically 50-200ms depending on the query and Postgres latency.
 
@@ -173,10 +294,14 @@ Configuration is loaded from a JSON file path resolved in this order:
 2. `~/.claude/ccp/config.json` (default location, alongside Claude Code's other state)
 3. Bundled defaults if no file exists
 
-The schema validates two top-level sections:
+The schema validates these top-level sections:
 
-- **`database`** — `host` (default `127.0.0.1`), `port` (default `5432`), `name` (default `ccp`), `user` (default `postgres`), `password` (default empty)
+- **`contextWindow`** — total context window in tokens (default `1_000_000`), used to compute the `context_pct` placeholder in the rendered status line
+- **`database`** — `host` (default `127.0.0.1`), `port` (default `54322` for Supabase local), `name` (default `postgres`), `user` (default `postgres`), `password` (default `postgres`), `schema` (default `public`)
+- **`framework`** — `drift` (default `permissive`, alternative `strict`). Controls generation detection behavior; see Drift Mode above.
 - **`geolocation`** — `service` URL (default `https://ipinfo.io/json`), optional `override` JSON string for offline use, `fallbackTimezone` (default `UTC`)
+- **`mcp`** — `sizeChars` (default `500000`), per-tool result size cap advertised in the `_meta` block of tool definitions
+- **`status`** — `service` URL for the Anthropic status page summary endpoint (default `https://status.claude.com/api/v2/summary.json`)
 
 The active profile is selected via the `CCP_PROFILE` environment variable, lowercased at every read so siblings can pass `DEVELOPER` or `developer` interchangeably. Required for `load(profile)` and `load(session)` (and any call that builds the session envelope).
 
@@ -200,10 +325,9 @@ There are no other required environment variables. The server runs out of the bo
 
 ### TypeScript Conventions
 
-- **Inferred return types on `McpTool` methods.** Each tool method (`load()`, `logResponse()`, `update()`) returns a literal config object without an explicit return-type annotation. This is intentional — TypeScript captures the specific shape of each `inputSchema` so `McpServer.registerTool`'s generic inference can propagate the input args type to the handler signature. Adding a wide return-type alias collapses the inference and breaks handler typing.
+- **Inferred return types on `McpTool` methods.** Each tool method (`load()`, `log()`, `update()`) returns a literal config object without an explicit return-type annotation. This is intentional — TypeScript captures the specific shape of each `inputSchema` so `McpServer.registerTool`'s generic inference can propagate the input args type to the handler signature. Adding a wide return-type alias collapses the inference and breaks handler typing.
 - **Discriminated union for `LoadResult`.** Each `case` in the `load` switch returns a different shape; the union's `type` discriminator lets callers narrow without runtime checks.
 - **`postgres-js` template tags.** Queries use the tagged-template form (e.g., `` sql`select ... where name = ${parent}` ``) so values are bound as parameters rather than interpolated. Identifier substitution (table or column names) uses `sql.unsafe(...)` only when the identifier comes from a trusted constant — never from tool input.
-- **`as never` on JSONB writes.** `args.status as never` in the session insert is a documented workaround for `postgres-js`'s template-tag type — JSONB columns accept arbitrary objects but the library types them as primitives. Cast is local and load-bearing; no broader `any` escape.
 
 ## Issues
 
