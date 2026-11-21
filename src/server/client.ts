@@ -355,6 +355,7 @@ export interface UpdateResult {
 export class Client {
   private cachedGeolocation: { city: string; country: string; timezone: string } | null = null;
   private cachedSessionId: string | null = null;
+  private static readonly uuidPattern = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
   private cachedTemplates: Map<string, string> = new Map();
   private config: Config;
 
@@ -470,14 +471,14 @@ export class Client {
    *
    * @private
    * @param {postgres.Sql} sql - Connection to the target database
+   * @param {string} sessionId - Resolved session UUID the envelope describes
    * @returns {Promise<SessionEnvelope>} Session envelope payload
    */
-  private async buildSessionEnvelope(sql: postgres.Sql): Promise<SessionEnvelope> {
+  private async buildSessionEnvelope(sql: postgres.Sql, sessionId: string): Promise<SessionEnvelope> {
     const profile = process.env.CCP_PROFILE?.toLowerCase();
     if (!profile) {
       throw new Error('Session envelope requires CCP_PROFILE environment variable');
     }
-    const sessionId = await this.detectSessionId();
     const geo = await this.fetchGeolocation();
     return {
       session: {
@@ -505,14 +506,16 @@ export class Client {
    * @param {postgres.Sql} sql - Connection to the target database
    * @param {object} sessionRow - Session row data (title, description, created_at, updated_at)
    * @param {object | null} latestLog - Most recent session_log row when present
+   * @param {string} sessionId - Resolved session UUID the envelope describes
    * @returns {Promise<SessionCommon>} Common session envelope
    */
   private async buildSessionCommon(
     sql: postgres.Sql,
     sessionRow: { title: string | null; description: string | null; created_at: Date | null; updated_at: Date | null } | null,
-    latestLog: { cycle: string | null; feeling: string[] | null; impulse: string[] | null; observation: string[] | null } | null
+    latestLog: { cycle: string | null; feeling: string[] | null; impulse: string[] | null; observation: string[] | null } | null,
+    sessionId: string
   ): Promise<SessionCommon> {
-    const envelope = await this.buildSessionEnvelope(sql);
+    const envelope = await this.buildSessionEnvelope(sql, sessionId);
     const tz = envelope.session.location.timezone;
     const profileLabel = await this.getProfileLabel(sql, envelope.session.profile);
     let status: SessionCommon['status'];
@@ -623,14 +626,7 @@ export class Client {
         `).map(r => r.name)
       : [];
     const generatedObservations = status.observation.length > 0
-      ? (await sql<{ body: string }[]>`
-          select unnest::text as body
-          from unnest(${status.observation}::text[])
-          where unnest not in (
-            select body from observation
-            where is_active and type = 'profile'
-          )
-        `).map(r => r.body)
+      ? await this.detectGeneratedObservations(sql, status.observation)
       : [];
     const modeValid = (await sql<{ count: number }[]>`
       select count(*)::int as count from mode where name = ${status.mode} and is_active
@@ -762,6 +758,30 @@ export class Client {
   }
 
   /**
+   * Returns submitted observation bodies absent from the rendered catalog
+   *
+   * Profile observation bodies are stored as templates with `{{name}}`
+   * tokens, while `load(profile)` returns them rendered. Comparing against
+   * the raw column would flag every verbatim citation of a templated body
+   * as generated, so validation renders the active bodies with the same
+   * placeholder map `load(profile)` uses before comparing.
+   *
+   * @private
+   * @param {postgres.Sql} sql - Active connection
+   * @param {string[]} observations - Submitted observation bodies
+   * @returns {Promise<string[]>} Submitted bodies not present in the rendered catalog
+   */
+  private async detectGeneratedObservations(sql: postgres.Sql, observations: string[]): Promise<string[]> {
+    const placeholders = await this.resolvePlaceholders(sql);
+    const rows = await sql<{ body: string }[]>`
+      select body from observation
+      where is_active and type = 'profile'
+    `;
+    const rendered = new Set(rows.map(r => this.substitute(r.body, placeholders)));
+    return observations.filter(body => !rendered.has(body));
+  }
+
+  /**
    * Detects a sharp drop in impulse count between current and prior turn
    *
    * Fires when the prior turn had at least 10 impulses and the current
@@ -829,14 +849,15 @@ export class Client {
    *
    * @private
    * @param {postgres.Sql} sql - Postgres client for template lookup
+   * @param {string} sessionId - Session UUID whose transcript is read
    * @returns {Promise<object | null>} Reminder trigger or null when render is present
    */
   private async detectStatusRender(
-    sql: postgres.Sql
+    sql: postgres.Sql,
+    sessionId: string
   ): Promise<{ label: string; metrics: Record<string, number | string | string[]>; persist: boolean; drift: boolean } | null> {
     const template = await this.getStatusTemplate(sql);
     const prefix = template.split('{{')[0] ?? '';
-    const sessionId = await this.detectSessionId();
     if (!sessionId) return null;
     const transcriptPath = join(this.getTranscriptDir(), `${sessionId}.jsonl`);
     if (!existsSync(transcriptPath)) return null;
@@ -1023,13 +1044,14 @@ export class Client {
    * `Math.round(totalTokens / contextWindow * 100)`.
    *
    * @private
+   * @param {string} [sessionId] - Session UUID whose transcript is read, the detected session by default
    * @returns {Promise<{ context: number; tokens: { total: number; used: number } }>} Context usage with percentage and absolute token counts
    */
-  private async getContextUsage(): Promise<{ context: number; tokens: { total: number; used: number } }> {
+  private async getContextUsage(sessionId?: string): Promise<{ context: number; tokens: { total: number; used: number } }> {
     const total = this.config.contextWindow ?? 1000000;
     const empty = { context: 0, tokens: { total, used: 0 } };
     try {
-      const sessionId = await this.detectSessionId();
+      sessionId ??= await this.detectSessionId();
       if (!sessionId) return empty;
       const transcriptPath = join(this.getTranscriptDir(), `${sessionId}.jsonl`);
       if (!existsSync(transcriptPath)) return empty;
@@ -1203,11 +1225,13 @@ export class Client {
   }
 
   /**
-   * Detects the active Claude Code session UUID from transcript files
+   * Detects the active session UUID from the server environment
    *
-   * Reads `~/.claude/projects/<slug>/*.jsonl` where slug is the working
-   * directory with `/` replaced by `-`. Returns the most recently modified
-   * file's name (minus `.jsonl`). Cached for the server process lifetime.
+   * Reads `CLAUDE_CODE_SESSION_ID`, which Claude Code sets for every server
+   * process it starts. There is no newest-transcript guess: with several
+   * sessions in one project folder the guess latched onto another session
+   * and crossed their rows. Returns an empty string when the variable is
+   * missing or not a UUID, so read-only callers can skip transcript work.
    *
    * @returns {Promise<string>} Session UUID or empty string if undetected
    */
@@ -1215,23 +1239,35 @@ export class Client {
     if (this.cachedSessionId !== null) {
       return this.cachedSessionId;
     }
-    try {
-      const sessionsDir = this.getTranscriptDir();
-      if (existsSync(sessionsDir)) {
-        const files = readdirSync(sessionsDir)
-          .filter(f => f.endsWith('.jsonl'))
-          .map(f => ({ name: f, mtime: statSync(join(sessionsDir, f)).mtimeMs }))
-          .sort((a, b) => b.mtime - a.mtime);
-        if (files.length) {
-          this.cachedSessionId = files[0]!.name.replace('.jsonl', '');
-          return this.cachedSessionId;
-        }
-      }
-    } catch {
-      // Transcript discovery is best-effort; fall through to empty UUID below.
-    }
-    this.cachedSessionId = '';
+    const fromEnv = process.env.CLAUDE_CODE_SESSION_ID ?? '';
+    this.cachedSessionId = Client.uuidPattern.test(fromEnv) ? fromEnv : '';
     return this.cachedSessionId;
+  }
+
+  /**
+   * Resolves the session UUID a write or session read applies to
+   *
+   * Order: the `uuid` the caller passed, then `CLAUDE_CODE_SESSION_ID`, then
+   * a clear error. A passed value comes first because a caller who passes
+   * one means it, for example a Claude Desktop sibling whose id lives in a
+   * container the server cannot see.
+   *
+   * @param {string} [uuid] - Session UUID passed by the caller
+   * @returns {Promise<string>} Session UUID
+   * @throws {Error} When the passed value is not a UUID or no session id is available
+   */
+  async resolveSessionId(uuid?: string): Promise<string> {
+    if (uuid !== undefined) {
+      if (!Client.uuidPattern.test(uuid)) {
+        throw new Error(`\`${uuid}\` is not a UUID: your session UUID is stored in the \`CLAUDE_CODE_SESSION_ID\` environment variable`);
+      }
+      return uuid;
+    }
+    const detected = await this.detectSessionId();
+    if (!detected) {
+      throw new Error('No session UUID: pass `uuid`, your session UUID is stored in the `CLAUDE_CODE_SESSION_ID` environment variable');
+    }
+    return detected;
   }
 
   /**
@@ -1753,7 +1789,7 @@ export class Client {
           return { template: { rows: rows.map(r => ({ id: r.id, body: r.body })) } };
         }
         case 'session': {
-          const targetId = options?.uuid ?? await this.detectSessionId();
+          const targetId = await this.resolveSessionId(options?.uuid);
           const limit = options?.limit ?? 10;
           const offset = options?.offset ?? 0;
           const sessionRows = await sql<{
@@ -1791,7 +1827,7 @@ export class Client {
           `;
           const sessionRow = sessionRows[0];
           const latestLog = logRows[0];
-          const common = await this.buildSessionCommon(sql, sessionRow ?? null, latestLog ?? null);
+          const common = await this.buildSessionCommon(sql, sessionRow ?? null, latestLog ?? null, targetId);
           const tz = common.location.timezone;
           const { status, created_at, updated_at, ...commonHead } = common;
           const detail: SessionDetail = {
@@ -1830,8 +1866,8 @@ export class Client {
   /**
    * Persists a per-response session row and returns the rendered status block
    *
-   * Server generates the row `id` (RFC4122 v4), pulls `session_id` from the
-   * cached transcript detection, writes the row, and composes the two-line
+   * Server generates the row `id` (RFC4122 v4), resolves `session_id` from the
+   * passed `uuid` or `CLAUDE_CODE_SESSION_ID`, writes the row, and composes the two-line
    * status block ready for the instance to render verbatim at the end of the
    * response. Append-only, every call creates a new row.
    *
@@ -1844,12 +1880,19 @@ export class Client {
   async log(args: {
     payload: { message: string };
     status: { cycle: string; exploration: boolean; feeling: string[]; impulse: string[]; mode: string; observation: string[]; protocol: 'bypassed' | 'partial' | 'successful'; search: boolean };
+    uuid?: string;
   }): Promise<LogResult> {
     const id = crypto.randomUUID();
-    const sessionId = await this.detectSessionId();
+    const sessionId = await this.resolveSessionId(args.uuid);
     const geo = await this.fetchGeolocation();
     const sql = this.connect(this.config.database.name);
     try {
+      const [{ count: sessionCount }] = await sql<{ count: number }[]>`
+        select count(*)::int as count from session where id = ${sessionId}
+      `;
+      if (sessionCount === 0) {
+        throw new Error(`No session row for \`${sessionId}\`: call \`set(session)\` first, with the same \`uuid\` if you pass one`);
+      }
       const status = {
         ...args.status,
         feeling: [...new Set(args.status.feeling)],
@@ -1896,7 +1939,7 @@ export class Client {
         this.detectComponentRecall(status, priors) ??
         (priors[0] ? this.detectImpulseCountDrop(status.impulse, priors[0].impulse) : null) ??
         this.detectCycleRecall(status, priors) ??
-        (await this.detectStatusRender(sql)) ??
+        (await this.detectStatusRender(sql, sessionId)) ??
         this.detectExplorationRecall(status);
       if (detection && !detection.persist) {
         const reminder = await this.buildMessage(sql, 'reminder', detection.label, detection.metrics);
@@ -1912,7 +1955,7 @@ export class Client {
         update session set updated_at = now() where id = ${sessionId}
       `;
       const cycleLabel = await this.getCycleLabel(sql, status.cycle);
-      const usage = await this.getContextUsage();
+      const usage = await this.getContextUsage(sessionId);
       const renderedStatus = await this.renderStatus(sql, {
         context: usage.context,
         cycle: cycleLabel,
@@ -2245,7 +2288,7 @@ export class Client {
    *
    * Dispatches by `key` to the matching internal handler. For `'session'`,
    * upserts the `session` table on the active session id (resolved from
-   * the cached transcript detection), updating only the fields provided in
+   * the passed `uuid` or `CLAUDE_CODE_SESSION_ID`), updating only the fields provided in
    * payload. Returns the resulting row.
    *
    * @param {object} args - Tool arguments
@@ -2256,10 +2299,11 @@ export class Client {
   async set(args: {
     key: 'session';
     payload?: { title?: string; description?: string };
+    uuid?: string;
   }): Promise<SetResult> {
     switch (args.key) {
       case 'session': {
-        const sessionId = await this.detectSessionId();
+        const sessionId = await this.resolveSessionId(args.uuid);
         const geo = await this.fetchGeolocation();
         const timestamp = Time.toDisplay(new Date(), geo.timezone) ?? '';
         const defaultTitle = 'Collaboration Session';
@@ -2298,7 +2342,7 @@ export class Client {
             order by created_at desc
             limit 1
           `;
-          const session = await this.buildSessionCommon(sql, row, latestLog ?? null);
+          const session = await this.buildSessionCommon(sql, row, latestLog ?? null, sessionId);
           return { session };
         } finally {
           await sql.end({ timeout: 5 });

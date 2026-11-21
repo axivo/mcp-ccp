@@ -145,7 +145,7 @@ export class McpTool {
    *
    * Called once per response at step 27 of the response protocol. Instance
    * supplies message prose and the structured status payload. Server generates
-   * the row id, pulls `session_id` from the cached transcript detection,
+   * the row id, resolves `session_id` from the passed `uuid` or `CLAUDE_CODE_SESSION_ID`,
    * writes the row, and returns the rendered two-line block ready to display.
    * Append-only, every call creates a new row.
    */
@@ -165,7 +165,8 @@ export class McpTool {
           observation: z.array(z.string()).describe('Applied observation bodies that informed the response'),
           protocol: z.enum(['bypassed', 'partial', 'successful']).describe('Response protocol execution outcome collapsed from the instance-internal step-completion map: `successful` when every step executed honestly, `bypassed` when every step skipped, `partial` otherwise. Server derives the status glyph from this value'),
           search: z.boolean().describe('Observation search outcome for this response: `true` when the instance searched the observation catalog against collaborator message keywords before formulating, `false` when the search step was skipped')
-        }).describe('Protocol execution record built during the response protocol')
+        }).describe('Protocol execution record built during the response protocol'),
+        uuid: z.string().optional().describe('Your session UUID, stored in the `CLAUDE_CODE_SESSION_ID` environment variable; pass it on every call in a host where the server cannot read it, such as Claude Desktop; the session row must exist, see `set`')
       },
       outputSchema: {
         action: z.object({
@@ -281,7 +282,8 @@ export class McpTool {
         payload: z.object({
           title: z.string().optional().describe('Conversation title for dashboard display'),
           description: z.string().optional().describe('Conversation description for dashboard display')
-        }).optional().describe('Fields to set; omit to ensure session row exists with server defaults')
+        }).optional().describe('Fields to set; omit to ensure session row exists with server defaults'),
+        uuid: z.string().optional().describe('Your session UUID, stored in the `CLAUDE_CODE_SESSION_ID` environment variable; pass it in a host where the server cannot read it, such as Claude Desktop')
       },
       outputSchema: {
         action: z.object({
@@ -321,7 +323,8 @@ export class McpTool {
           'Call `set(session, payload)` later to refine title or description',
           'Send only the fields you want to change, absent fields preserve existing values',
           'Server fills default title and description when payload is omitted',
-          'Server upserts on active session, populating uuid from transcript detection',
+          'Pass `uuid` in Claude Desktop, your session UUID is stored in the `CLAUDE_CODE_SESSION_ID` environment variable',
+          'Server upserts on active session, the passed `uuid` first, then `CLAUDE_CODE_SESSION_ID`',
           'Use `load(session)` to read session state without mutating the row'
         ]
       }
