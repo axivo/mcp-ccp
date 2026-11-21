@@ -50,6 +50,7 @@ runtime: docker
 vmType: vz
 EOF
 brew services restart colima
+brew services list
 colima status
 install -d ~/.claude/ccp
 cd ~/.claude/ccp
@@ -203,6 +204,10 @@ Call `status` first at session start to discover the tool surface. Call `update`
        - `observation` (string array): Applied observation bodies that informed the response (profile-chain only; feeling-attached and impulse-attached observations don't belong here)
        - `protocol` (enum): Response protocol execution outcome collapsed from the sibling-internal step-completion map: `successful` when every step executed honestly, `bypassed` when every step skipped, `partial` otherwise. Server derives the status glyph from this value (`successful` → 🟢, `partial` → 🟡, `bypassed` → 🔴).
        - `search` (boolean): `true` when the sibling searched the observation catalog against collaborator message keywords before formulating, `false` when search was skipped.
+   - Optional inputs:
+     - `uuid` (string): Your session UUID, stored in the `CLAUDE_CODE_SESSION_ID` environment variable. Claude Code passes it to the server automatically; in Claude Desktop it lives in your own environment, not the server's, so read it once with a shell call and pass it on every `set` and `log` call. A seat without a shell needs another way to learn its id. The session row must exist, so call `set(session)` with the same `uuid` first
+   - Session id: the passed `uuid` first, then `CLAUDE_CODE_SESSION_ID`, otherwise an error naming the fix. There is no transcript guess, and a `uuid` with no session row is refused so a typo can't create a session
+   - `CLAUDE_CODE_SESSION_ID` is read from the server's environment, which is set when the server starts. If your session id changes while the same server keeps running, rows go to the id the server started with. Pass `uuid` in that case
    - Returns on success: `{ payload: { context, reminder, response, status, tokens: { total, used } }, timestamp }`
      - `payload.context` — Active session context usage percentage from transcript
      - `payload.reminder` — Either a single-line string from a rotating anchor pool, or a structured `{ preamble: string[], steps: Record<string, string>, metrics: object }` body when a soft drift trigger fires. Read inward as framework guidance.
@@ -233,8 +238,9 @@ Call `status` first at session start to discover the tool surface. Call `update`
      - `payload` (object): Fields to set; omit to ensure session row exists with server defaults
        - `title` (string): Conversation title for dashboard display
        - `description` (string): Conversation description for dashboard display
+     - `uuid` (string): Your session UUID, stored in the `CLAUDE_CODE_SESSION_ID` environment variable; pass it in Claude Desktop, where the server can't read it
    - Returns: `{ session: { uuid, title, description, profile, location: { city, country, is_dst, timezone }, created_at, updated_at } }`
-   - Server upserts on the active session, populating `uuid` from the cached transcript detection
+   - Server upserts on the session from the passed `uuid`, otherwise from `CLAUDE_CODE_SESSION_ID`
    - Send only the fields you want to change; absent fields preserve existing values
    - Same `session` shape as `load(session)` minus `payload` and `status`
 
