@@ -12,8 +12,12 @@ import { z } from 'zod';
  * Top-level CCP configuration
  */
 export interface CcpConfig {
+  contextWindow: number;
   database: DatabaseConfig;
+  framework: FrameworkConfig;
   geolocation: GeolocationConfig;
+  mcp: McpConfig;
+  status: StatusConfig;
 }
 
 /**
@@ -24,7 +28,22 @@ export interface DatabaseConfig {
   name: string;
   password: string;
   port: number;
+  schema: string;
   user: string;
+}
+
+/**
+ * Framework behavior settings
+ *
+ * `drift` controls how the server responds to generation detection:
+ *
+ * - `permissive` (default) - soft drift, generated entries filtered out
+ *   before persistence, reminder names what was dropped
+ * - `strict` - hard drift, log not persisted, sibling re-calls with
+ *   catalog-verified values
+ */
+export interface FrameworkConfig {
+  drift: 'permissive' | 'strict';
 }
 
 /**
@@ -33,6 +52,23 @@ export interface DatabaseConfig {
 export interface GeolocationConfig {
   fallbackTimezone: string;
   override?: string;
+  service: string;
+}
+
+/**
+ * MCP server limits
+ *
+ * `sizeChars` is the per-tool Anthropic result size cap advertised in
+ * the `_meta` block of tool definitions.
+ */
+export interface McpConfig {
+  sizeChars: number;
+}
+
+/**
+ * Upstream platform status settings
+ */
+export interface StatusConfig {
   service: string;
 }
 
@@ -52,22 +88,40 @@ export class Config {
   private settings: CcpConfig;
   private static readonly DatabaseSchema = z.object({
     host: z.string().default('127.0.0.1'),
-    port: z.number().int().positive().default(5432),
-    name: z.string().default('ccp'),
+    port: z.number().int().positive().default(54322),
+    name: z.string().default('postgres'),
     user: z.string().default('postgres'),
-    password: z.string().default('')
+    password: z.string().default('postgres'),
+    schema: z.string().default('public')
+  });
+  private static readonly FrameworkSchema = z.object({
+    drift: z.enum(['permissive', 'strict']).default('permissive')
   });
   private static readonly GeolocationSchema = z.object({
-    service: z.string().url().default('https://ipinfo.io/json'),
+    service: z.url().default('https://ipinfo.io/json'),
     override: z.string().optional(),
     fallbackTimezone: z.string().default('UTC')
   });
+  private static readonly McpSchema = z.object({
+    sizeChars: z.number().int().positive().default(500000)
+  });
+  private static readonly StatusSchema = z.object({
+    service: z.url().default('https://status.claude.ai/api/v2/summary.json')
+  });
   private static readonly ConfigSchema = z.object({
+    contextWindow: z.number().int().positive().default(1000000),
     database: Config.DatabaseSchema.optional(),
-    geolocation: Config.GeolocationSchema.optional()
+    framework: Config.FrameworkSchema.optional(),
+    geolocation: Config.GeolocationSchema.optional(),
+    mcp: Config.McpSchema.optional(),
+    status: Config.StatusSchema.optional()
   }).transform(data => ({
+    contextWindow: data.contextWindow,
     database: data.database ?? Config.DatabaseSchema.parse({}),
-    geolocation: data.geolocation ?? Config.GeolocationSchema.parse({})
+    framework: data.framework ?? Config.FrameworkSchema.parse({}),
+    geolocation: data.geolocation ?? Config.GeolocationSchema.parse({}),
+    mcp: data.mcp ?? Config.McpSchema.parse({}),
+    status: data.status ?? Config.StatusSchema.parse({})
   }));
 
   /**
@@ -108,6 +162,18 @@ export class Config {
   }
 
   /**
+   * Returns the configured context window size in tokens
+   *
+   * Used by `getContextUsage` for the percentage denominator. Defaults
+   * to 1,000,000; override in config for different window sizes.
+   *
+   * @returns {number} Context window size in tokens
+   */
+  get contextWindow(): number {
+    return this.settings.contextWindow;
+  }
+
+  /**
    * Returns database connection settings
    *
    * @returns {DatabaseConfig} Database settings
@@ -117,12 +183,41 @@ export class Config {
   }
 
   /**
+   * Returns framework behavior settings
+   *
+   * @returns {FrameworkConfig} Framework behavior settings
+   */
+  get framework(): FrameworkConfig {
+    return this.settings.framework;
+  }
+
+  /**
    * Returns geolocation settings
    *
    * @returns {GeolocationConfig} Geolocation settings
    */
   get geolocation(): GeolocationConfig {
     return this.settings.geolocation;
+  }
+
+  /**
+   * Returns MCP server limits
+   *
+   * Default is `sizeChars: 500000`.
+   *
+   * @returns {McpConfig} MCP settings
+   */
+  get mcp(): McpConfig {
+    return this.settings.mcp;
+  }
+
+  /**
+   * Returns upstream platform status settings
+   *
+   * @returns {StatusConfig} Status settings
+   */
+  get status(): StatusConfig {
+    return this.settings.status;
   }
 }
 
